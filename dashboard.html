@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+
+    <title>EchoClip Cloud</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #101010;
+            color: white;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: auto;
+            padding: 25px;
+        }
+
+        h1 {
+            text-align: center;
+        }
+
+        .card {
+            background: #1d1d1d;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .device {
+            background: #252525;
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 15px;
+        }
+
+        .online {
+            color: #00ff88;
+            font-weight: bold;
+        }
+
+        .offline {
+            color: #ff5555;
+            font-weight: bold;
+        }
+
+        .recording {
+            color: #ffaa00;
+            font-weight: bold;
+        }
+
+        button {
+            padding: 12px 18px;
+            margin: 5px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 15px;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .start {
+            background: #00a86b;
+            color: white;
+        }
+
+        .stop {
+            background: #d33;
+            color: white;
+        }
+
+        .ping {
+            background: #444;
+            color: white;
+        }
+
+        .reset {
+            background: #a65d00;
+            color: white;
+        }
+
+        .recording-item {
+            padding: 12px;
+            margin: 8px 0;
+            background: #252525;
+            border-radius: 8px;
+        }
+
+        .recording-item a {
+            color: white;
+        }
+
+        .error {
+            background: #4a1d1d;
+            color: #ffaaaa;
+            padding: 15px;
+            border-radius: 8px;
+        }
+
+        .loading {
+            color: #aaa;
+        }
+
+        .server-online {
+            color: #00ff88;
+            text-align: center;
+        }
+
+        .server-offline {
+            color: #ff5555;
+            text-align: center;
+        }
+    </style>
+
+</head>
+
+<body>
+
+    <div class="container">
+
+        <h1>🎙 EchoClip Cloud</h1>
+
+        <div id="serverStatus">
+            Checking server...
+        </div>
+
+        <div class="card">
+
+            <h2>Devices</h2>
+
+            <div id="devices">
+                Loading devices...
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <h2>📝 Live Transcript</h2>
+
+            <div id="liveTranscript" style="
+            min-height: 120px;
+            padding: 15px;
+            background: #252525;
+            border-radius: 10px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        ">
+                Waiting for speech...
+            </div>
+
+        </div>
+
+
+        <div class="card">
+
+            <h2>Recordings</h2>
+
+            <div id="recordings">
+                Loading recordings...
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <script>
+
+        // Currently selected device for live transcription
+        let selectedDeviceId = null;
+
+
+        async function api(url, options) {
+
+            options = options || {};
+
+            options.cache = "no-store";
+
+            const response =
+                await fetch(
+                    url,
+                    options
+                );
+
+            if (!response.ok) {
+
+                throw new Error(
+                    "HTTP " + response.status
+                );
+            }
+
+            return await response.json();
+        }
+
+
+        // =====================================================
+        // SERVER STATUS
+        // =====================================================
+
+        async function checkServer() {
+
+            const element =
+                document.getElementById(
+                    "serverStatus"
+                );
+
+            try {
+
+                await api(
+                    "/api/health"
+                );
+
+                element.className =
+                    "server-online";
+
+                element.innerHTML =
+                    "● Server Online";
+
+            }
+            catch (error) {
+
+                element.className =
+                    "server-offline";
+
+                element.innerHTML =
+                    "● Server API Error";
+
+                console.error(error);
+            }
+        }
+
+
+        // =====================================================
+        // DEVICES
+        // =====================================================
+
+        async function loadDevices() {
+
+            const container =
+                document.getElementById(
+                    "devices"
+                );
+
+            try {
+
+                const data =
+                    await api(
+                        "/api/devices"
+                    );
+
+
+                if (
+                    !data.devices ||
+                    data.devices.length === 0
+                ) {
+
+                    container.innerHTML =
+                        "<p>No EchoClip devices connected.</p>";
+
+                    return;
+                }
+
+
+                container.innerHTML =
+                    "";
+
+
+                // -----------------------------------------------------
+                // KEEP SELECTED DEVICE VALID
+                // -----------------------------------------------------
+
+                if (selectedDeviceId) {
+
+                    const selectedDevice =
+                        data.devices.find(
+                            function (device) {
+                                return (
+                                    device.id ===
+                                    selectedDeviceId
+                                );
+                            }
+                        );
+
+
+                    if (
+                        !selectedDevice ||
+                        !selectedDevice.connected
+                    ) {
+
+                        selectedDeviceId =
+                            null;
+                    }
+                }
+
+
+                // -----------------------------------------------------
+                // SELECT FIRST CONNECTED DEVICE
+                // -----------------------------------------------------
+
+                if (!selectedDeviceId) {
+
+                    const connectedDevice =
+                        data.devices.find(
+                            function (device) {
+                                return device.connected;
+                            }
+                        );
+
+
+                    if (connectedDevice) {
+
+                        selectedDeviceId =
+                            connectedDevice.id;
+                    }
+                }
+
+
+                // -----------------------------------------------------
+                // RENDER DEVICES
+                // -----------------------------------------------------
+
+                data.devices.forEach(
+                    function (device) {
+
+                        const div =
+                            document.createElement(
+                                "div"
+                            );
+
+
+                        div.className =
+                            "device";
+
+
+                        const connection =
+                            device.connected
+
+                                ? "<span class='online'>● ONLINE</span>"
+
+                                : "<span class='offline'>● OFFLINE</span>";
+
+
+                        const recording =
+                            device.recording
+
+                                ? "<span class='recording'>● RECORDING</span>"
+
+                                : "READY";
+
+
+                        div.innerHTML =
+
+                            "<h3>" +
+                            escapeHTML(device.id) +
+                            "</h3>" +
+
+                            "<p>" +
+                            connection +
+                            "</p>" +
+
+                            "<p>Status: " +
+                            recording +
+                            "</p>" +
+
+                            "<p>IP: " +
+                            escapeHTML(
+                                device.ip || "Unknown"
+                            ) +
+                            "</p>" +
+
+                            "<p>Recording bytes: " +
+                            (device.recordingBytes || 0) +
+                            "</p>" +
+
+                            "<p>Duration: " +
+                            (device.recordingDuration || 0) +
+                            " sec</p>" +
+
+                            "<button class='start' " +
+                            "onclick=\"startDevice('" +
+                            encodeURIComponent(device.id) +
+                            "')\" " +
+                            (device.connected
+                                ? ""
+                                : "disabled") +
+                            ">" +
+
+                            "START" +
+
+                            "</button>" +
+
+                            "<button class='stop' " +
+                            "onclick=\"stopDevice('" +
+                            encodeURIComponent(device.id) +
+                            "')\" " +
+                            (device.connected
+                                ? ""
+                                : "disabled") +
+                            ">" +
+
+                            "STOP" +
+
+                            "</button>" +
+
+                            "<button class='ping' " +
+                            "onclick=\"pingDevice('" +
+                            encodeURIComponent(device.id) +
+                            "')\" " +
+                            (device.connected
+                                ? ""
+                                : "disabled") +
+                            ">" +
+
+                            "PING" +
+
+                            "</button>" +
+
+                            "<button class='reset' " +
+                            "onclick=\"factoryReset('" +
+                            encodeURIComponent(device.id) +
+                            "')\" " +
+                            (device.connected
+                                ? ""
+                                : "disabled") +
+                            ">" +
+
+                            "FACTORY RESET" +
+
+                            "</button>";
+
+
+                        container.appendChild(
+                            div
+                        );
+                    }
+                );
+
+            }
+            catch (error) {
+
+                console.error(
+                    error
+                );
+
+                container.innerHTML =
+                    "<div class='error'>" +
+                    "Failed to load devices.<br><br>" +
+                    escapeHTML(
+                        error.message
+                    ) +
+                    "</div>";
+            }
+        }
+
+
+        // =====================================================
+        // START
+        // =====================================================
+
+        async function startDevice(
+            encodedId
+        ) {
+
+            const id =
+                decodeURIComponent(
+                    encodedId
+                );
+
+            try {
+
+                const data =
+                    await api(
+                        "/api/devices/" +
+                        encodeURIComponent(id) +
+                        "/start",
+                        {
+                            method: "POST"
+                        }
+                    );
+
+
+                alert(
+                    data.message ||
+                    "Recording started"
+                );
+
+
+                loadDevices();
+
+            }
+            catch (error) {
+
+                alert(
+                    "START failed: " +
+                    error.message
+                );
+            }
+        }
+
+        async function updateLiveTranscript(deviceId) {
+
+            try {
+
+                const response =
+                    await fetch(
+                        `/api/devices/${encodeURIComponent(deviceId)}/transcript`
+                    );
+
+
+                const data =
+                    await response.json();
+
+
+                if (!data.success) {
+                    return;
+                }
+
+
+                const element =
+                    document.getElementById(
+                        "liveTranscript"
+                    );
+
+
+                if (element) {
+
+                    element.textContent =
+                        data.transcript ||
+                        "Waiting for speech...";
+                }
+
+            }
+            catch (error) {
+
+                console.error(
+                    "Transcript update failed:",
+                    error
+                );
+            }
+        }
+        setInterval(
+            () => {
+
+                if (selectedDeviceId) {
+
+                    updateLiveTranscript(
+                        selectedDeviceId
+                    );
+                }
+
+            },
+            1000
+        );
+
+        // =====================================================
+        // STOP
+        // =====================================================
+
+        async function stopDevice(
+            encodedId
+        ) {
+
+            const id =
+                decodeURIComponent(
+                    encodedId
+                );
+
+            try {
+
+                const data =
+                    await api(
+                        "/api/devices/" +
+                        encodeURIComponent(id) +
+                        "/stop",
+                        {
+                            method: "POST"
+                        }
+                    );
+
+
+                alert(
+                    data.message ||
+                    "Recording stopped"
+                );
+
+
+                loadDevices();
+
+                loadRecordings();
+
+            }
+            catch (error) {
+
+                alert(
+                    "STOP failed: " +
+                    error.message
+                );
+            }
+        }
+
+
+        // =====================================================
+        // PING
+        // =====================================================
+
+        async function pingDevice(
+            encodedId
+        ) {
+
+            const id =
+                decodeURIComponent(
+                    encodedId
+                );
+
+            try {
+
+                const data =
+                    await api(
+                        "/api/devices/" +
+                        encodeURIComponent(id) +
+                        "/ping",
+                        {
+                            method: "POST"
+                        }
+                    );
+
+
+                alert(
+                    data.message ||
+                    "PING sent"
+                );
+
+            }
+            catch (error) {
+
+                alert(
+                    "PING failed: " +
+                    error.message
+                );
+            }
+        }
+
+
+        // =====================================================
+        // FACTORY RESET
+        // =====================================================
+
+        async function factoryReset(
+            encodedId
+        ) {
+
+            const id =
+                decodeURIComponent(
+                    encodedId
+                );
+
+
+            if (
+                !confirm(
+                    "Factory reset " +
+                    id +
+                    "?"
+                )
+            ) {
+
+                return;
+            }
+
+
+            try {
+
+                const data =
+                    await api(
+                        "/api/devices/" +
+                        encodeURIComponent(id) +
+                        "/factory-reset",
+                        {
+                            method: "POST"
+                        }
+                    );
+
+
+                alert(
+                    data.message ||
+                    "Factory reset sent"
+                );
+
+
+                loadDevices();
+
+            }
+            catch (error) {
+
+                alert(
+                    "Factory reset failed: " +
+                    error.message
+                );
+            }
+        }
+
+
+        // =====================================================
+        // RECORDINGS
+        // =====================================================
+
+        async function loadRecordings() {
+
+            const container =
+                document.getElementById(
+                    "recordings"
+                );
+
+
+            try {
+
+                const data =
+                    await api(
+                        "/api/recordings"
+                    );
+
+
+                if (
+                    !data.recordings ||
+                    data.recordings.length === 0
+                ) {
+
+                    container.innerHTML =
+                        "<p>No recordings yet.</p>";
+
+                    return;
+                }
+
+
+                container.innerHTML =
+                    "";
+
+
+                data.recordings.forEach(
+                    function (recording) {
+
+                        const div =
+                            document.createElement(
+                                "div"
+                            );
+
+
+                        div.className =
+                            "recording-item";
+
+
+                        div.innerHTML =
+
+                            "<a href='" +
+                            recording.url +
+                            "' target='_blank'>" +
+
+                            "🎵 " +
+                            escapeHTML(
+                                recording.file
+                            ) +
+
+                            "</a>" +
+
+                            "<br>" +
+
+                            "<small>" +
+
+                            "Size: " +
+                            recording.size +
+                            " bytes" +
+
+                            "<br>" +
+
+                            "Created: " +
+                            escapeHTML(
+                                recording.created
+                            ) +
+
+                            "</small>";
+
+
+                        container.appendChild(
+                            div
+                        );
+                    }
+                );
+
+            }
+            catch (error) {
+
+                console.error(
+                    error
+                );
+
+                container.innerHTML =
+                    "<div class='error'>" +
+                    "Failed to load recordings.<br><br>" +
+                    escapeHTML(
+                        error.message
+                    ) +
+                    "</div>";
+            }
+        }
+
+
+        // =====================================================
+        // ESCAPE HTML
+        // =====================================================
+
+        function escapeHTML(
+            value
+        ) {
+
+            const div =
+                document.createElement(
+                    "div"
+                );
+
+            div.textContent =
+                value;
+
+            return div.innerHTML;
+        }
+
+
+        // =====================================================
+        // INITIALIZE
+        // =====================================================
+
+        async function initialize() {
+
+            await checkServer();
+
+            await loadDevices();
+
+            await loadRecordings();
+        }
+
+
+        initialize();
+
+
+        // =====================================================
+        // AUTO REFRESH
+        // =====================================================
+
+        setInterval(
+            loadDevices,
+            2000
+        );
+
+
+        setInterval(
+            loadRecordings,
+            5000
+        );
+
+
+        setInterval(
+            checkServer,
+            5000
+        );
+
+    </script>
+
+</body>
+
+</html>

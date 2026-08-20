@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const {
     execFile
 } = require("child_process");
+const { createClient } = require("redis");
 // =====================================================
 // CONFIGURATION
 // =====================================================
@@ -36,8 +37,514 @@ const TRANSCRIPTION_CHUNK_BYTES =
 const ELEVENLABS_API_KEY =
     process.env.ELEVENLABS_API_KEY;
 
+
 const ELEVENLABS_MODEL =
     "scribe_v2";
+
+// =====================================================
+// TRANSCRIPTION CACHE
+// =====================================================
+
+// 500 MB total rolling transcription cache across ALL devices.
+const TRANSCRIPT_CACHE_MAX_BYTES =
+    500 * 1024 * 1024;
+
+// Set REDIS_URL in .env to your AWS ElastiCache/Valkey endpoint.
+// Use rediss:// when TLS is enabled.
+const REDIS_URL =
+    process.env.REDIS_URL || "";
+
+const redisClient =
+    REDIS_URL
+        ? createClient({ url: REDIS_URL })
+        : null;
+
+let redisReady = false;
+let transcriptCacheBytes = 0;
+let cacheMutationQueue = Promise.resolve();
+
+const TRANSCRIPT_GLOBAL_INDEX =
+    "echoclip:transcript:index";
+
+const TRANSCRIPT_BYTES_KEY =
+    "echoclip:transcript:bytes";
+
+function transcriptDeviceIndexKey(deviceId) {
+    return `echoclip:transcript:device:${deviceId}`;
+}
+
+function transcriptChunkKey(deviceId, chunkId) {
+    return `echoclip:transcript:chunk:${deviceId}:${chunkId}`;
+}
+
+function queueCacheMutation(fn) {
+    const run =
+        cacheMutationQueue.then(fn, fn);
+
+    cacheMutationQueue =
+        run.catch(() => {});
+
+    return run;
+}
+
+// -----------------------------------------------------
+// IN-MEMORY FALLBACK
+// -----------------------------------------------------
+
+const memoryTranscriptCache =
+    new Map();
+
+let memoryTranscriptCacheBytes = 0;
+
+// -----------------------------------------------------
+// REDIS / ELASTICACHE INITIALIZATION
+// -----------------------------------------------------
+
+async function initializeTranscriptCache() {
+
+    if (!redisClient) {
+
+        console.log(
+            "Transcript cache: IN-MEMORY FALLBACK"
+        );
+
+        return;
+    }
+
+    redisClient.on(
+        "error",
+        error => {
+
+            redisReady = false;
+
+            console.error(
+                "Redis cache error:",
+                error.message
+            );
+        }
+    );
+
+    try {
+
+        await redisClient.connect();
+
+        redisReady = true;
+
+        const storedBytes =
+            await redisClient.get(
+                TRANSCRIPT_BYTES_KEY
+            );
+
+        transcriptCacheBytes =
+            Number(storedBytes || 0);
+
+        console.log(
+            `Transcript cache: REDIS/ELASTICACHE CONNECTED | ` +
+            `limit 500 MB | ` +
+            `current ${(transcriptCacheBytes / 1024 / 1024).toFixed(2)} MB`
+        );
+
+        await evictTranscriptCacheIfNeeded();
+
+    }
+    catch (error) {
+
+        redisReady = false;
+
+        console.error(
+            "Redis connection failed:",
+            error.message
+        );
+
+        console.error(
+            "Using bounded in-memory transcription cache."
+        );
+    }
+}
+
+function getCacheMode() {
+
+    return redisReady
+        ? "redis"
+        : "memory";
+}
+
+// -----------------------------------------------------
+// EVICT OLDEST DATA
+// -----------------------------------------------------
+
+async function evictTranscriptCacheIfNeeded() {
+
+    if (!redisReady) {
+
+        while (
+            memoryTranscriptCacheBytes >
+                TRANSCRIPT_CACHE_MAX_BYTES &&
+            memoryTranscriptCache.size > 0
+        ) {
+
+            const oldestKey =
+                memoryTranscriptCache
+                    .keys()
+                    .next()
+                    .value;
+
+            const entry =
+                memoryTranscriptCache.get(
+                    oldestKey
+                );
+
+            memoryTranscriptCache.delete(
+                oldestKey
+            );
+
+            memoryTranscriptCacheBytes =
+                Math.max(
+                    0,
+                    memoryTranscriptCacheBytes -
+                        Number(entry.bytes || 0)
+                );
+        }
+
+        return;
+    }
+
+    while (
+        transcriptCacheBytes >
+            TRANSCRIPT_CACHE_MAX_BYTES
+    ) {
+
+        const oldest =
+            await redisClient.zRange(
+                TRANSCRIPT_GLOBAL_INDEX,
+                0,
+                0
+            );
+
+        if (!oldest.length) {
+
+            transcriptCacheBytes = 0;
+
+            await redisClient.set(
+                TRANSCRIPT_BYTES_KEY,
+                "0"
+            );
+
+            break;
+        }
+
+        const chunkKey =
+            oldest[0];
+
+        const raw =
+            await redisClient.get(
+                chunkKey
+            );
+
+        await redisClient.zRem(
+            TRANSCRIPT_GLOBAL_INDEX,
+            chunkKey
+        );
+
+        if (!raw) {
+            continue;
+        }
+
+        let entry;
+
+        try {
+            entry = JSON.parse(raw);
+        }
+        catch (_) {
+            entry = {
+                bytes:
+                    Buffer.byteLength(
+                        raw,
+                        "utf8"
+                    )
+            };
+        }
+
+        const bytes =
+            Number(entry.bytes || 0);
+
+        if (entry.deviceId) {
+
+            await redisClient.zRem(
+                transcriptDeviceIndexKey(
+                    entry.deviceId
+                ),
+                chunkKey
+            );
+        }
+
+        await redisClient.del(
+            chunkKey
+        );
+
+        transcriptCacheBytes =
+            Math.max(
+                0,
+                transcriptCacheBytes -
+                    bytes
+            );
+
+        await redisClient.set(
+            TRANSCRIPT_BYTES_KEY,
+            String(transcriptCacheBytes)
+        );
+    }
+}
+
+// -----------------------------------------------------
+// ADD TRANSCRIPT
+// -----------------------------------------------------
+
+async function addTranscriptToCache(
+    device,
+    chunkNumber,
+    text
+) {
+
+    const normalizedText =
+        String(text || "").trim();
+
+    if (!normalizedText) {
+        return;
+    }
+
+    const entry = {
+        deviceId: device.id,
+        chunkNumber,
+        timestamp: Date.now(),
+        text: normalizedText,
+        bytes:
+            Buffer.byteLength(
+                normalizedText,
+                "utf8"
+            )
+    };
+
+    if (
+        entry.bytes >
+            TRANSCRIPT_CACHE_MAX_BYTES
+    ) {
+
+        console.warn(
+            `[${device.id}] Transcript chunk is larger than 500 MB. Discarded.`
+        );
+
+        return;
+    }
+
+    await queueCacheMutation(
+        async () => {
+
+            if (!redisReady) {
+
+                const chunkId =
+                    `${Date.now()}-${crypto
+                        .randomBytes(6)
+                        .toString("hex")}`;
+
+                memoryTranscriptCache.set(
+                    chunkId,
+                    entry
+                );
+
+                memoryTranscriptCacheBytes +=
+                    entry.bytes;
+
+                await evictTranscriptCacheIfNeeded();
+
+                return;
+            }
+
+            const chunkId =
+                `${Date.now()}-${crypto
+                    .randomBytes(6)
+                    .toString("hex")}`;
+
+            const key =
+                transcriptChunkKey(
+                    device.id,
+                    chunkId
+                );
+
+            await redisClient.set(
+                key,
+                JSON.stringify(entry)
+            );
+
+            await redisClient.zAdd(
+                TRANSCRIPT_GLOBAL_INDEX,
+                {
+                    score: entry.timestamp,
+                    value: key
+                }
+            );
+
+            await redisClient.zAdd(
+                transcriptDeviceIndexKey(
+                    device.id
+                ),
+                {
+                    score: entry.timestamp,
+                    value: key
+                }
+            );
+
+            transcriptCacheBytes +=
+                entry.bytes;
+
+            await redisClient.set(
+                TRANSCRIPT_BYTES_KEY,
+                String(transcriptCacheBytes)
+            );
+
+            await evictTranscriptCacheIfNeeded();
+        }
+    );
+}
+
+// -----------------------------------------------------
+// GET DEVICE TRANSCRIPT
+// -----------------------------------------------------
+
+async function getDeviceTranscript(
+    deviceId
+) {
+
+    if (!redisReady) {
+
+        return Array.from(
+            memoryTranscriptCache.values()
+        )
+            .filter(
+                entry =>
+                    entry.deviceId === deviceId
+            )
+            .sort(
+                (a, b) => {
+
+                    if (
+                        a.chunkNumber !==
+                        b.chunkNumber
+                    ) {
+                        return (
+                            a.chunkNumber -
+                            b.chunkNumber
+                        );
+                    }
+
+                    return (
+                        a.timestamp -
+                        b.timestamp
+                    );
+                }
+            );
+    }
+
+    const keys =
+        await redisClient.zRange(
+            transcriptDeviceIndexKey(
+                deviceId
+            ),
+            0,
+            -1
+        );
+
+    if (!keys.length) {
+        return [];
+    }
+
+    const values =
+        await redisClient.mGet(
+            keys
+        );
+
+    return values
+        .filter(Boolean)
+        .map(raw => {
+
+            try {
+                return JSON.parse(raw);
+            }
+            catch (_) {
+                return null;
+            }
+        })
+        .filter(Boolean)
+        .sort(
+            (a, b) => {
+
+                if (
+                    a.chunkNumber !==
+                    b.chunkNumber
+                ) {
+                    return (
+                        a.chunkNumber -
+                        b.chunkNumber
+                    );
+                }
+
+                return (
+                    a.timestamp -
+                    b.timestamp
+                );
+            }
+        );
+}
+
+// -----------------------------------------------------
+// CACHE STATUS
+// -----------------------------------------------------
+
+async function getTranscriptCacheStats() {
+
+    const bytes =
+        redisReady
+            ? Number(
+                await redisClient.get(
+                    TRANSCRIPT_BYTES_KEY
+                ) || 0
+            )
+            : memoryTranscriptCacheBytes;
+
+    return {
+        backend:
+            getCacheMode(),
+
+        maxBytes:
+            TRANSCRIPT_CACHE_MAX_BYTES,
+
+        maxMB:
+            TRANSCRIPT_CACHE_MAX_BYTES /
+            1024 / 1024,
+
+        usedBytes:
+            bytes,
+
+        usedMB:
+            Number(
+                (
+                    bytes /
+                    1024 /
+                    1024
+                ).toFixed(2)
+            ),
+
+        usagePercent:
+            Number(
+                (
+                    bytes /
+                    TRANSCRIPT_CACHE_MAX_BYTES *
+                    100
+                ).toFixed(2)
+            )
+    };
+}
+
 
 if (!ELEVENLABS_API_KEY) {
 
@@ -51,12 +558,19 @@ if (!ELEVENLABS_API_KEY) {
 // DIRECTORIES
 // =====================================================
 
-const recordingsDir =
-    path.join(__dirname, "recordings");
+// Audio is NEVER stored permanently.
+// Temporary WAV files are kept only during transcription.
+const os = require("os");
 
-if (!fs.existsSync(recordingsDir)) {
+const tempAudioDir =
+    path.join(
+        os.tmpdir(),
+        "echoclip-transcription"
+    );
+
+if (!fs.existsSync(tempAudioDir)) {
     fs.mkdirSync(
-        recordingsDir,
+        tempAudioDir,
         { recursive: true }
     );
 }
@@ -177,138 +691,6 @@ function getTimestamp() {
 // CREATE WAV
 // =====================================================
 
-function createWavFile(
-    pcmPath,
-    wavPath
-) {
-
-    const pcmData =
-        fs.readFileSync(pcmPath);
-
-
-    const byteRate =
-        SAMPLE_RATE *
-        CHANNELS *
-        BITS_PER_SAMPLE / 8;
-
-
-    const blockAlign =
-        CHANNELS *
-        BITS_PER_SAMPLE / 8;
-
-
-    const header =
-        Buffer.alloc(44);
-
-
-    // RIFF
-
-    header.write(
-        "RIFF",
-        0
-    );
-
-
-    header.writeUInt32LE(
-        36 + pcmData.length,
-        4
-    );
-
-
-    // WAVE
-
-    header.write(
-        "WAVE",
-        8
-    );
-
-
-    // fmt
-
-    header.write(
-        "fmt ",
-        12
-    );
-
-
-    header.writeUInt32LE(
-        16,
-        16
-    );
-
-
-    // PCM
-
-    header.writeUInt16LE(
-        1,
-        20
-    );
-
-
-    // channels
-
-    header.writeUInt16LE(
-        CHANNELS,
-        22
-    );
-
-
-    // sample rate
-
-    header.writeUInt32LE(
-        SAMPLE_RATE,
-        24
-    );
-
-
-    // byte rate
-
-    header.writeUInt32LE(
-        byteRate,
-        28
-    );
-
-
-    // block align
-
-    header.writeUInt16LE(
-        blockAlign,
-        32
-    );
-
-
-    // bits
-
-    header.writeUInt16LE(
-        BITS_PER_SAMPLE,
-        34
-    );
-
-
-    // data
-
-    header.write(
-        "data",
-        36
-    );
-
-
-    header.writeUInt32LE(
-        pcmData.length,
-        40
-    );
-
-
-    fs.writeFileSync(
-        wavPath,
-        Buffer.concat([
-            header,
-            pcmData
-        ])
-    );
-}
-
-
 // =====================================================
 // DEVICE ID
 // =====================================================
@@ -370,15 +752,6 @@ function createDevice(
         recordingStarted:
             null,
 
-        pcmFile:
-            null,
-
-        pcmPath:
-            null,
-
-        wavPath:
-            null,
-
         recordingId:
             null,
 
@@ -396,7 +769,6 @@ function createDevice(
 
         transcriptionProcessing:
             false,
-        transcriptionResults: {},
 
         liveTranscript:
             ""
@@ -484,42 +856,20 @@ function startRecording(
 
 
     // -------------------------------------------------
-    // FILE NAMES
+    // RECORDING SESSION
     // -------------------------------------------------
+    // No permanent PCM/WAV file is created.
+    // Audio remains in RAM only until a 30-second
+    // transcription chunk is processed.
 
     const timestamp =
         getTimestamp();
 
-
     const recordingId =
         `${device.id}_${timestamp}`;
 
-
-    const pcmPath =
-        path.join(
-            recordingsDir,
-            `${recordingId}.pcm`
-        );
-
-
-    const wavPath =
-        path.join(
-            recordingsDir,
-            `${recordingId}.wav`
-        );
-
-
     device.recordingId =
         recordingId;
-
-
-    device.pcmPath =
-        pcmPath;
-
-
-    device.wavPath =
-        wavPath;
-
 
     device.recordingBytes =
         0;
@@ -535,10 +885,10 @@ function startRecording(
 
     device.transcriptionProcessing =
         false;
-    device.transcriptionResults = {};
 
     device.liveTranscript =
         "";
+
     device.expectingRecordingData =
         false;
 
@@ -547,12 +897,6 @@ function startRecording(
 
     device.recording =
         true;
-
-    device.pcmFile =
-        fs.createWriteStream(
-            pcmPath
-        );
-
 
     // -------------------------------------------------
     // SEND COMMAND
@@ -567,10 +911,6 @@ function startRecording(
 
     if (!sent) {
         device.recording = false;
-        device.pcmFile.end();
-
-        device.pcmFile =
-            null;
 
         return {
             success: false,
@@ -696,71 +1036,16 @@ function finishRecording(
     device
 ) {
 
-    if (!device.pcmFile) {
-
-        device.recording =
-            false;
-
+    if (!device) {
         return;
     }
 
+    // Permanent recording storage is disabled.
+    // Temporary transcription files are removed by
+    // processTranscriptionChunk().
 
-    const pcmFile =
-        device.pcmFile;
-
-
-    const pcmPath =
-        device.pcmPath;
-
-
-    const wavPath =
-        device.wavPath;
-
-
-    device.pcmFile =
-        null;
-
-
-    pcmFile.end(
-        () => {
-
-            try {
-
-                createWavFile(
-                    pcmPath,
-                    wavPath
-                );
-
-
-                console.log(
-                    `[${device.id}] WAV created: ${wavPath}`
-                );
-
-
-                const duration =
-                    device.recordingBytes /
-                    (
-                        SAMPLE_RATE *
-                        CHANNELS *
-                        (BITS_PER_SAMPLE / 8)
-                    );
-
-
-                console.log(
-                    `[${device.id}] Duration: ${duration.toFixed(2)} sec`
-                );
-
-
-            }
-            catch (error) {
-
-                console.error(
-                    "WAV creation error:",
-                    error.message
-                );
-            }
-        }
-    );
+    device.recording =
+        false;
 }
 
 
@@ -1247,8 +1532,7 @@ const tcpServer =
 
                 if (
                     !device ||
-                    !device.recording ||
-                    !device.pcmFile
+                    !device.recording
                 ) {
                     return;
                 }
@@ -1261,11 +1545,8 @@ const tcpServer =
                 }
 
 
-                device.pcmFile.write(
-                    audioData
-                );
-
-
+                // Audio is held only in RAM for the
+                // active 30-second transcription chunk.
                 device.recordingBytes +=
                     audioData.length;
 
@@ -1714,15 +1995,19 @@ async function processTranscriptionChunk(
 
     const rawWavPath =
         path.join(
-            recordingsDir,
-            `${baseName}_raw.wav`
+            tempAudioDir,
+            `${baseName}_${crypto
+                .randomBytes(4)
+                .toString("hex")}_raw.wav`
         );
 
 
     const cleanWavPath =
         path.join(
-            recordingsDir,
-            `${baseName}_clean.wav`
+            tempAudioDir,
+            `${baseName}_${crypto
+                .randomBytes(4)
+                .toString("hex")}_clean.wav`
         );
 
 
@@ -1791,45 +2076,40 @@ async function processTranscriptionChunk(
 
 
         // =================================================
-        // 4. STORE TRANSCRIPT IN CHUNK ORDER
+        // 4. STORE TRANSCRIPT IN 500 MB ROLLING CACHE
         // =================================================
 
-        device.transcriptionResults[
-            chunkNumber
-        ] = text;
+        await addTranscriptToCache(
+            device,
+            chunkNumber,
+            text
+        );
 
+        // Keep the API response lightweight. The cache can
+        // contain up to 500 MB, but we only expose the latest
+        // 50 chunks (normally about 25 minutes) as live text.
+        const recentEntries =
+            await getDeviceTranscript(
+                device.id
+            );
 
-        // Rebuild transcript in correct order
-
-        const orderedTexts =
-            Object.keys(
-                device.transcriptionResults
-            )
-                .sort(
-                    (a, b) =>
-                        Number(a) - Number(b)
-                )
+        const recentTexts =
+            recentEntries
+                .slice(-50)
                 .map(
-                    key =>
-                        device.transcriptionResults[key]
+                    entry =>
+                        entry.text
                 )
-                .filter(
-                    text =>
-                        text &&
-                        text.length > 0
-                );
-
+                .filter(Boolean);
 
         device.liveTranscript =
-            orderedTexts.join(" ");
-
+            recentTexts.join(" ");
 
         console.log(
             `[${device.id}] ` +
-            `Live transcript updated`
+            `Transcript cached | ` +
+            `chunk #${chunkNumber}`
         );
-
-
     }
     catch (error) {
 
@@ -1837,6 +2117,40 @@ async function processTranscriptionChunk(
             `[${device.id}] ` +
             `Chunk #${chunkNumber} transcription failed:`,
             error.message
+        );
+    }
+    finally {
+
+        // Delete temporary audio immediately.
+        for (const filePath of [
+            rawWavPath,
+            cleanWavPath
+        ]) {
+
+            try {
+
+                if (
+                    fs.existsSync(
+                        filePath
+                    )
+                ) {
+                    fs.unlinkSync(
+                        filePath
+                    );
+                }
+            }
+            catch (cleanupError) {
+
+                console.error(
+                    `[${device.id}] Temporary audio cleanup failed:`,
+                    cleanupError.message
+                );
+            }
+        }
+
+        console.log(
+            `[${device.id}] ` +
+            `Chunk #${chunkNumber} temporary audio deleted`
         );
     }
 }
@@ -1918,6 +2232,9 @@ const httpServer =
 
                         devices:
                             devices.size,
+
+                        transcriptCache:
+                            await getTranscriptCacheStats(),
 
                         time:
                             new Date().toISOString()
@@ -2067,6 +2384,9 @@ const httpServer =
                 }
 
 
+                const cacheStats =
+                    await getTranscriptCacheStats();
+
                 sendJSON(
                     res,
                     200,
@@ -2080,7 +2400,10 @@ const httpServer =
                             device.recording,
 
                         transcript:
-                            device.liveTranscript || ""
+                            device.liveTranscript || "",
+
+                        cache:
+                            cacheStats
                     }
                 );
 
@@ -2343,8 +2666,33 @@ const httpServer =
 
 
             // =================================================
+            // API: TRANSCRIPTION CACHE STATUS
+            // =================================================
+
+            if (
+                pathname ===
+                "/api/transcript-cache" &&
+                req.method === "GET"
+            ) {
+
+                sendJSON(
+                    res,
+                    200,
+                    {
+                        success: true,
+                        cache:
+                            await getTranscriptCacheStats()
+                    }
+                );
+
+                return;
+            }
+
+
+            // =================================================
             // API: RECORDINGS
             // =================================================
+            // Permanent recordings are disabled.
 
             if (
                 pathname ===
@@ -2352,73 +2700,15 @@ const httpServer =
                 req.method === "GET"
             ) {
 
-                const files =
-                    fs.readdirSync(
-                        recordingsDir
-                    );
-
-
-                const recordings =
-                    files
-                        .filter(
-                            file =>
-                                file.endsWith(
-                                    ".wav"
-                                )
-                        )
-                        .map(
-                            file => {
-
-                                const fullPath =
-                                    path.join(
-                                        recordingsDir,
-                                        file
-                                    );
-
-
-                                const stat =
-                                    fs.statSync(
-                                        fullPath
-                                    );
-
-
-                                return {
-
-                                    file,
-
-                                    size:
-                                        stat.size,
-
-                                    created:
-                                        stat.birthtime
-                                            .toISOString(),
-
-                                    url:
-                                        `/recordings/${encodeURIComponent(file)}`
-                                };
-                            }
-                        )
-                        .sort(
-                            (
-                                a,
-                                b
-                            ) =>
-                                b.created.localeCompare(
-                                    a.created
-                                )
-                        );
-
-
                 sendJSON(
                     res,
                     200,
                     {
                         success: true,
-
-                        count:
-                            recordings.length,
-
-                        recordings
+                        count: 0,
+                        recordings: [],
+                        message:
+                            "Permanent audio storage is disabled."
                     }
                 );
 
@@ -2429,6 +2719,7 @@ const httpServer =
             // =================================================
             // SERVE RECORDINGS
             // =================================================
+            // No permanent audio files are available.
 
             if (
                 pathname.startsWith(
@@ -2436,67 +2727,15 @@ const httpServer =
                 )
             ) {
 
-                const filename =
-                    decodeURIComponent(
-                        pathname.substring(
-                            "/recordings/"
-                                .length
-                        )
-                    );
-
-
-                // Prevent path traversal
-
-                const safeName =
-                    path.basename(
-                        filename
-                    );
-
-
-                const filePath =
-                    path.join(
-                        recordingsDir,
-                        safeName
-                    );
-
-
-                if (
-                    !fs.existsSync(
-                        filePath
-                    )
-                ) {
-
-                    res.writeHead(
-                        404
-                    );
-
-                    res.end(
-                        "Not found"
-                    );
-
-                    return;
-                }
-
-
-                res.writeHead(
-                    200,
+                sendJSON(
+                    res,
+                    404,
                     {
-                        "Content-Type":
-                            "audio/wav",
-
-                        "Access-Control-Allow-Origin":
-                            "*"
+                        success: false,
+                        error:
+                            "PERMANENT_RECORDINGS_DISABLED"
                     }
                 );
-
-
-                fs.createReadStream(
-                    filePath
-                )
-                    .pipe(
-                        res
-                    );
-
 
                 return;
             }
@@ -2918,6 +3157,13 @@ function createWavFromPCM(
         ])
     );
 }
+
+// Initialize the transcript cache before accepting devices.
+initializeTranscriptCache()
+    .catch(error => {
+        console.error("Transcript cache initialization error:", error.message);
+    });
+
 
 // =====================================================
 // START TCP SERVER

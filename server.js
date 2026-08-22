@@ -29,9 +29,6 @@
         const UDP_PACKET_END = 3;
         const UDP_DEVICE_ID_LEN = 24;
         const UDP_MIN_HEADER_SIZE = 46;
-        const UDP_AUTH_TOKEN_LEN = 16;
-        const UDP_SHARED_TOKEN = (process.env.UDP_SHARED_TOKEN || "").trim();
-        const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
         const SAMPLE_RATE = 16000;
         const CHANNELS = 1;
@@ -573,9 +570,15 @@
         // DIRECTORIES
         // =====================================================
 
-        // Audio is NEVER stored permanently.
-        // Temporary WAV files are kept only during transcription.
+        // Permanent recordings are stored as WAV files on disk.
+        // Temporary WAV files are used only for transcription.
         const os = require("os");
+
+        const recordingsDir =
+            path.join(
+                __dirname,
+                "recordings"
+            );
 
         const tempAudioDir =
             path.join(
@@ -583,11 +586,13 @@
                 "echoclip-transcription"
             );
 
-        if (!fs.existsSync(tempAudioDir)) {
-            fs.mkdirSync(
-                tempAudioDir,
-                { recursive: true }
-            );
+        for (const dir of [recordingsDir, tempAudioDir]) {
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(
+                    dir,
+                    { recursive: true }
+                );
+            }
         }
 
 
@@ -770,6 +775,15 @@
                 recordingId:
                     null,
 
+                recordingFilePath:
+                    null,
+
+                recordingFd:
+                    null,
+
+                recordingStorageError:
+                    null,
+
                 expectingRecordingData:
                     false,
 
@@ -873,15 +887,62 @@
             // -------------------------------------------------
             // RECORDING SESSION
             // -------------------------------------------------
-            // No permanent PCM/WAV file is created.
-            // Audio remains in RAM only until a 30-second
-            // transcription chunk is processed.
+            // A permanent WAV file is opened immediately.
+            // Incoming PCM is appended directly to disk so
+            // long recordings do not consume server RAM.
 
             const timestamp =
                 getTimestamp();
 
             const recordingId =
                 `${device.id}_${timestamp}`;
+
+            const recordingFilePath =
+                path.join(
+                    recordingsDir,
+                    `${recordingId}.wav`
+                );
+
+            try {
+
+                if (fs.existsSync(recordingFilePath)) {
+                    throw new Error(
+                        "Recording file already exists"
+                    );
+                }
+
+                const fd =
+                    fs.openSync(
+                        recordingFilePath,
+                        "w"
+                    );
+
+                // Reserve the standard 44-byte WAV header.
+                fs.writeSync(
+                    fd,
+                    createWavHeader(0),
+                    0,
+                    44,
+                    0
+                );
+
+                device.recordingFd = fd;
+                device.recordingFilePath = recordingFilePath;
+                device.recordingStorageError = null;
+            }
+            catch (error) {
+
+                console.error(
+                    `[${device.id}] Unable to create recording file:`,
+                    error.message
+                );
+
+                return {
+                    success: false,
+                    error: "RECORDING_STORAGE_FAILED",
+                    details: error.message
+                };
+            }
 
             device.recordingId =
                 recordingId;
@@ -925,7 +986,9 @@
 
 
             if (!sent) {
+
                 device.recording = false;
+                closeRecordingFile(device, true);
 
                 return {
                     success: false,
@@ -935,18 +998,16 @@
 
 
             console.log(
-                `[${device.id}] Recording started`
+                `[${device.id}] Recording started | ` +
+                `WAV: ${recordingFilePath}`
             );
 
 
             return {
                 success: true,
-
-                recordingId:
-                    recordingId,
-
-                message:
-                    "RECORDING_STARTED"
+                recordingId: recordingId,
+                recordingFile: path.basename(recordingFilePath),
+                message: "RECORDING_STARTED"
             };
         }
 
@@ -970,16 +1031,12 @@
 
             if (!device.recording) {
 
-                // Still tell ESP32 to stop
-
                 if (device.connected) {
-
                     sendCommand(
                         device,
                         "STOP"
                     );
                 }
-
 
                 return {
                     success: true,
@@ -993,79 +1050,209 @@
             // -------------------------------------------------
 
             if (device.connected) {
-
                 sendCommand(
                     device,
                     "STOP"
                 );
             }
 
-
-            device.recording =
-            false;
+            device.recording = false;
 
 
-        // -------------------------------------------------
-        // PROCESS FINAL PARTIAL TRANSCRIPTION CHUNK
-        // -------------------------------------------------
+            // -------------------------------------------------
+            // FINAL TRANSCRIPTION CHUNK
+            // -------------------------------------------------
 
-        processRemainingTranscription(
-            device
-        )
-        .catch(
-            error => {
-                console.error(
-                    `[${device.id}] Final transcription failed:`,
-                    error.message
-                );
-            }
-        );
+            processRemainingTranscription(
+                device
+            )
+            .catch(
+                error => {
+                    console.error(
+                        `[${device.id}] Final transcription failed:`,
+                        error.message
+                    );
+                }
+            );
 
 
-        // -------------------------------------------------
-        // CLOSE FILE
-        // -------------------------------------------------
+            // -------------------------------------------------
+            // FINALIZE PERMANENT WAV
+            // -------------------------------------------------
 
-        finishRecording(
-            device
-        );
+            const saved =
+                finishRecording(device);
 
 
             return {
                 success: true,
-
-                recordingId:
-                    device.recordingId,
-
-                message:
-                    "RECORDING_STOPPED"
+                recordingId: device.recordingId,
+                recordingFile: saved.file,
+                recordingBytes: device.recordingBytes,
+                recordingDuration: Number(
+                    (
+                        device.recordingBytes /
+                        (SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE / 8))
+                    ).toFixed(2)
+                ),
+                recordingUrl: saved.url,
+                message: saved.error
+                    ? "RECORDING_STOPPED_STORAGE_ERROR"
+                    : "RECORDING_STOPPED"
             };
         }
 
 
         // =====================================================
-        // FINISH RECORDING
+        // CLOSE / FINALIZE PERMANENT RECORDING
         // =====================================================
 
-        function finishRecording(
-            device
+        function closeRecordingFile(
+            device,
+            deleteFile = false
         ) {
 
             if (!device) {
                 return;
             }
 
-            // Permanent recording storage is disabled.
-            // Temporary transcription files are removed by
-            // processTranscriptionChunk().
+            const fd =
+                device.recordingFd;
 
-            device.recording =
-                false;
+            const filePath =
+                device.recordingFilePath;
+
+            try {
+
+                if (fd !== null && fd !== undefined) {
+                    fs.closeSync(fd);
+                }
+            }
+            catch (error) {
+                console.error(
+                    `[${device.id}] Recording file close failed:`,
+                    error.message
+                );
+            }
+
+            device.recordingFd = null;
+
+            if (
+                deleteFile &&
+                filePath &&
+                fs.existsSync(filePath)
+            ) {
+                try {
+                    fs.unlinkSync(filePath);
+                }
+                catch (error) {
+                    console.error(
+                        `[${device.id}] Failed to delete incomplete recording:`,
+                        error.message
+                    );
+                }
+            }
+        }
+
+
+        function finishRecording(
+            device
+        ) {
+
+            if (!device) {
+                return {
+                    file: null,
+                    url: null,
+                    error: "DEVICE_NOT_FOUND"
+                };
+            }
+
+            const filePath =
+                device.recordingFilePath;
+
+            if (!filePath || device.recordingFd === null) {
+                device.recording = false;
+
+                return {
+                    file: null,
+                    url: null,
+                    error: "RECORDING_FILE_NOT_OPEN"
+                };
+            }
+
+            try {
+
+                // Patch the WAV header with the final PCM size.
+                const header =
+                    createWavHeader(
+                        device.recordingBytes
+                    );
+
+                fs.writeSync(
+                    device.recordingFd,
+                    header,
+                    0,
+                    header.length,
+                    0
+                );
+
+                fs.closeSync(
+                    device.recordingFd
+                );
+
+                device.recordingFd = null;
+                device.recording = false;
+
+                const stat =
+                    fs.statSync(filePath);
+
+                console.log(
+                    `[${device.id}] Recording saved | ` +
+                    `${path.basename(filePath)} | ` +
+                    `${stat.size} bytes | ` +
+                    `${(
+                        device.recordingBytes /
+                        (SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE / 8))
+                    ).toFixed(2)} sec`
+                );
+
+                return {
+                    file: path.basename(filePath),
+                    url: `/recordings/${encodeURIComponent(path.basename(filePath))}`,
+                    size: stat.size
+                };
+            }
+            catch (error) {
+
+                device.recordingStorageError =
+                    error.message;
+
+                console.error(
+                    `[${device.id}] Recording finalization failed:`,
+                    error.message
+                );
+
+                closeRecordingFile(device, false);
+                device.recording = false;
+
+                return {
+                    file: filePath
+                        ? path.basename(filePath)
+                        : null,
+                    url: filePath
+                        ? `/recordings/${encodeURIComponent(path.basename(filePath))}`
+                        : null,
+                    error: error.message
+                };
+            }
         }
 
 
         // =====================================================
         // FACTORY RESET
+        // =====================================================
+
+
         // =====================================================
 
         function factoryReset(
@@ -1213,7 +1400,20 @@
                 recordingDuration:
                     Number(
                         duration.toFixed(2)
-                    )
+                    ),
+
+                recordingFile:
+                    device.recordingFilePath
+                        ? path.basename(device.recordingFilePath)
+                        : null,
+
+                recordingUrl:
+                    device.recordingFilePath
+                        ? `/recordings/${encodeURIComponent(path.basename(device.recordingFilePath))}`
+                        : null,
+
+                recordingStorageError:
+                    device.recordingStorageError || null
             };
         }
 
@@ -1732,13 +1932,10 @@
 
 
         // =====================================================
-        // PRODUCTION UDP AUDIO SERVER (ESP32 -> AWS)
+        // UDP AUDIO SERVER (ESP32 -> AWS)
         // =====================================================
 
         const udpServer = dgram.createSocket("udp4");
-
-        const UDP_REORDER_MAX_PACKETS = 4;
-        const UDP_REORDER_MAX_WAIT_MS = 120;
 
         const udpStats = {
             packets: 0,
@@ -1746,53 +1943,10 @@
             audioBytes: 0,
             malformed: 0,
             unknownDevice: 0,
-            droppedSequence: 0,
-            reorderedPackets: 0,
-            duplicatePackets: 0,
-            latePackets: 0,
-            recoveredSilenceBytes: 0,
-            activeStreams: 0
+            droppedSequence: 0
         };
 
-        // Per-device jitter/reorder state. UDP is intentionally unordered,
-        // so production audio must not immediately concatenate packets.
-        const udpStreams = new Map();
-
-        function getUdpStream(deviceId) {
-            let stream = udpStreams.get(deviceId);
-
-            if (!stream) {
-                stream = {
-                    nextSequence: null,
-                    pending: new Map(),
-                    firstPendingAt: 0,
-                    payloadBytes: 0,
-                    lastPacketAt: Date.now()
-                };
-                udpStreams.set(deviceId, stream);
-                udpStats.activeStreams = udpStreams.size;
-            }
-
-            return stream;
-        }
-
-        function resetUdpStream(deviceId) {
-            udpStreams.set(deviceId, {
-                nextSequence: null,
-                pending: new Map(),
-                firstPendingAt: 0,
-                payloadBytes: 0,
-                lastPacketAt: Date.now()
-            });
-            udpStats.activeStreams = udpStreams.size;
-            return udpStreams.get(deviceId);
-        }
-
-        function isSequenceBehind(sequence, expected) {
-            if (expected === null || expected === undefined) return false;
-            const distance = (sequence - expected) >>> 0;
-            return distance > 0x80000000;
-        }
+        const udpLastSequence = new Map();
 
         function parseEchoUdpPacket(message) {
             if (!Buffer.isBuffer(message) || message.length < UDP_MIN_HEADER_SIZE) {
@@ -1812,7 +1966,6 @@
 
             if (magic !== ECHO_UDP_MAGIC || version !== ECHO_UDP_VERSION) return null;
             if (headerSize < UDP_MIN_HEADER_SIZE || headerSize > message.length) return null;
-            if (payloadBytes > 1400) return null;
             if (headerSize + payloadBytes > message.length) return null;
 
             const deviceId = message
@@ -1822,19 +1975,6 @@
                 .trim();
 
             if (!deviceId) return null;
-
-            let authToken = "";
-            if (headerSize >= UDP_MIN_HEADER_SIZE + UDP_AUTH_TOKEN_LEN) {
-                authToken = message
-                    .subarray(46, 46 + UDP_AUTH_TOKEN_LEN)
-                    .toString("utf8")
-                    .replace(/\0.*$/, "")
-                    .trim();
-            }
-
-            if (UDP_SHARED_TOKEN && authToken !== UDP_SHARED_TOKEN) {
-                return null;
-            }
 
             return {
                 packetType,
@@ -1856,6 +1996,27 @@
             device.expectingRecordingData = true;
             device.recordingBytes += payload.length;
             device.audioBytes += payload.length;
+
+            // Persist the exact incoming PCM stream to the permanent WAV.
+            try {
+                if (device.recordingFd !== null && device.recordingFd !== undefined) {
+                    fs.writeSync(
+                        device.recordingFd,
+                        payload,
+                        0,
+                        payload.length
+                    );
+                }
+            }
+            catch (error) {
+                device.recordingStorageError = error.message;
+                console.error(
+                    `[${device.id}] Permanent recording write failed:`,
+                    error.message
+                );
+                closeRecordingFile(device, false);
+            }
+
             device.transcriptionBuffer.push(Buffer.from(payload));
             device.transcriptionBufferBytes += payload.length;
             processTranscriptionBuffer(device);
@@ -1867,65 +2028,6 @@
                     `[${device.id}] UDP Recording ${seconds.toFixed(1)} sec | ` +
                     `${device.recordingBytes} bytes`
                 );
-            }
-        }
-
-        function flushUdpStream(device, stream, force) {
-            if (!device || !stream || stream.nextSequence === null) return;
-
-            while (stream.pending.has(stream.nextSequence)) {
-                const payload = stream.pending.get(stream.nextSequence);
-                stream.pending.delete(stream.nextSequence);
-                ingestUdpAudio(device, payload);
-                stream.payloadBytes = payload.length;
-                stream.nextSequence = (stream.nextSequence + 1) >>> 0;
-            }
-
-            if (stream.pending.size === 0) {
-                stream.firstPendingAt = 0;
-                return;
-            }
-
-            const waitedMs = stream.firstPendingAt
-                ? Date.now() - stream.firstPendingAt
-                : 0;
-
-            // If the expected packet has not arrived within the jitter window,
-            // preserve the audio timeline by inserting silence for the missing
-            // packet rather than compressing the recording in time.
-            while (
-                stream.pending.size > UDP_REORDER_MAX_PACKETS ||
-                (force && stream.pending.size > 0) ||
-                (stream.firstPendingAt && waitedMs >= UDP_REORDER_MAX_WAIT_MS)
-            ) {
-                const silenceBytes = stream.payloadBytes ||
-                    stream.pending.values().next().value?.length || 0;
-
-                if (silenceBytes <= 0) break;
-
-                ingestUdpAudio(
-                    device,
-                    Buffer.alloc(silenceBytes)
-                );
-
-                udpStats.droppedSequence++;
-                udpStats.recoveredSilenceBytes += silenceBytes;
-                stream.nextSequence = (stream.nextSequence + 1) >>> 0;
-
-                while (stream.pending.has(stream.nextSequence)) {
-                    const payload = stream.pending.get(stream.nextSequence);
-                    stream.pending.delete(stream.nextSequence);
-                    ingestUdpAudio(device, payload);
-                    stream.payloadBytes = payload.length;
-                    stream.nextSequence = (stream.nextSequence + 1) >>> 0;
-                }
-
-                if (stream.pending.size === 0) {
-                    stream.firstPendingAt = 0;
-                    break;
-                }
-
-                stream.firstPendingAt = Date.now();
             }
         }
 
@@ -1950,20 +2052,14 @@
             device.lastSeen = Date.now();
 
             if (packet.packetType === UDP_PACKET_START) {
-                resetUdpStream(packet.deviceId);
-                const stream = udpStreams.get(packet.deviceId);
-                stream.nextSequence = packet.sequence >>> 0;
+                udpLastSequence.set(packet.deviceId, packet.sequence);
+                device.expectingRecordingData = true;
                 console.log(`[${device.id}] UDP AUDIO START from ${rinfo.address}:${rinfo.port}`);
                 return;
             }
 
             if (packet.packetType === UDP_PACKET_END) {
-                const stream = udpStreams.get(packet.deviceId);
-                if (stream) {
-                    flushUdpStream(device, stream, true);
-                }
-                udpStreams.delete(packet.deviceId);
-                udpStats.activeStreams = udpStreams.size;
+                udpLastSequence.delete(packet.deviceId);
                 console.log(`[${device.id}] UDP AUDIO END`);
                 return;
             }
@@ -1971,6 +2067,7 @@
             if (packet.packetType !== UDP_PACKET_AUDIO) return;
             if (!device.recording) return;
 
+            // Validate the format expected by the server/transcription pipeline.
             if (
                 packet.sampleRate !== SAMPLE_RATE ||
                 packet.bitsPerSample !== BITS_PER_SAMPLE ||
@@ -1984,52 +2081,20 @@
                 return;
             }
 
-            const stream = getUdpStream(packet.deviceId);
-            stream.lastPacketAt = Date.now();
-            stream.payloadBytes = packet.payload.length;
-
-            if (stream.nextSequence === null) {
-                stream.nextSequence = packet.sequence >>> 0;
-            }
-
-            if (isSequenceBehind(packet.sequence, stream.nextSequence)) {
-                udpStats.latePackets++;
-                return;
-            }
-
-            if (stream.pending.has(packet.sequence)) {
-                udpStats.duplicatePackets++;
-                return;
-            }
-
-            if (packet.sequence !== stream.nextSequence) {
-                udpStats.reorderedPackets++;
-                if (stream.firstPendingAt === 0) {
-                    stream.firstPendingAt = Date.now();
+            const previous = udpLastSequence.get(packet.deviceId);
+            if (previous !== undefined) {
+                const expected = (previous + 1) >>> 0;
+                if (packet.sequence !== expected) {
+                    const gap = (packet.sequence - expected) >>> 0;
+                    if (gap < 1000000) udpStats.droppedSequence += gap;
                 }
             }
+            udpLastSequence.set(packet.deviceId, packet.sequence);
 
-            stream.pending.set(packet.sequence, packet.payload);
             udpStats.audioPackets++;
             udpStats.audioBytes += packet.payload.length;
-
-            flushUdpStream(device, stream, false);
+            ingestUdpAudio(device, packet.payload);
         });
-
-        // Periodically flush a packet that has waited beyond the jitter window.
-        // This prevents a single lost packet from permanently stalling a stream.
-        const udpFlushTimer = setInterval(() => {
-            const now = Date.now();
-            for (const [deviceId, stream] of udpStreams) {
-                if (!stream.pending.size) continue;
-                if (!stream.firstPendingAt) continue;
-                if (now - stream.firstPendingAt < UDP_REORDER_MAX_WAIT_MS) continue;
-
-                const device = devices.get(deviceId);
-                if (device) flushUdpStream(device, stream, false);
-            }
-        }, 25);
-        udpFlushTimer.unref?.();
 
         udpServer.on("error", error => {
             console.error("UDP SERVER ERROR:", error);
@@ -2076,7 +2141,7 @@
                         "application/json",
 
                     "Access-Control-Allow-Origin":
-                        ALLOWED_ORIGIN,
+                        "*",
 
                     "Access-Control-Allow-Methods":
                         "GET,POST,OPTIONS",
@@ -2514,7 +2579,7 @@
                             204,
                             {
                                 "Access-Control-Allow-Origin":
-                                    ALLOWED_ORIGIN,
+                                    "*",
 
                                 "Access-Control-Allow-Methods":
                                     "GET,POST,OPTIONS",
@@ -2568,9 +2633,6 @@
 
                                 udpPort:
                                     UDP_PORT,
-
-                                udpAuthentication:
-                                    UDP_SHARED_TOKEN ? "enabled" : "disabled",
 
                                 udpStats:
                                     udpStats,
@@ -3040,7 +3102,6 @@
                     // =================================================
                     // API: RECORDINGS
                     // =================================================
-                    // Permanent recordings are disabled.
 
                     if (
                         pathname ===
@@ -3048,15 +3109,74 @@
                         req.method === "GET"
                     ) {
 
+                        let recordings = [];
+
+                        try {
+                            recordings =
+                                fs.readdirSync(
+                                    recordingsDir
+                                )
+                                .filter(
+                                    file =>
+                                        file.toLowerCase().endsWith(".wav")
+                                )
+                                .map(
+                                    file => {
+                                        const fullPath =
+                                            path.join(
+                                                recordingsDir,
+                                                file
+                                            );
+
+                                        const stat =
+                                            fs.statSync(fullPath);
+
+                                        const pcmBytes =
+                                            Math.max(
+                                                0,
+                                                stat.size - 44
+                                            );
+
+                                        return {
+                                            file: file,
+                                            size: stat.size,
+                                            duration: Number(
+                                                (
+                                                    pcmBytes /
+                                                    (SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE / 8))
+                                                ).toFixed(2)
+                                            ),
+                                            created: stat.birthtime.toISOString(),
+                                            modified: stat.mtime.toISOString(),
+                                            url: `/recordings/${encodeURIComponent(file)}`
+                                        };
+                                    }
+                                )
+                                .sort(
+                                    (a, b) =>
+                                        b.created.localeCompare(a.created)
+                                );
+                        }
+                        catch (error) {
+                            sendJSON(
+                                res,
+                                500,
+                                {
+                                    success: false,
+                                    error: "RECORDINGS_LIST_FAILED",
+                                    details: error.message
+                                }
+                            );
+                            return;
+                        }
+
                         sendJSON(
                             res,
                             200,
                             {
                                 success: true,
-                                count: 0,
-                                recordings: [],
-                                message:
-                                    "Permanent audio storage is disabled."
+                                count: recordings.length,
+                                recordings: recordings
                             }
                         );
 
@@ -3065,25 +3185,135 @@
 
 
                     // =================================================
-                    // SERVE RECORDINGS
-                    // =================================================
-                    // No permanent audio files are available.
+                    // SERVE RECORDINGS WITH HTTP RANGE SUPPORT
+                    // =====================================================
 
                     if (
                         pathname.startsWith(
                             "/recordings/"
-                        )
+                        ) &&
+                        req.method === "GET"
                     ) {
 
-                        sendJSON(
-                            res,
-                            404,
+                        const requestedName =
+                            decodeURIComponent(
+                                pathname.substring(
+                                    "/recordings/".length
+                                )
+                            );
+
+                        const safeName =
+                            path.basename(requestedName);
+
+                        if (safeName !== requestedName || !safeName.toLowerCase().endsWith(".wav")) {
+                            sendJSON(
+                                res,
+                                400,
+                                {
+                                    success: false,
+                                    error: "INVALID_RECORDING_NAME"
+                                }
+                            );
+                            return;
+                        }
+
+                        const filePath =
+                            path.join(
+                                recordingsDir,
+                                safeName
+                            );
+
+                        if (!fs.existsSync(filePath)) {
+                            sendJSON(
+                                res,
+                                404,
+                                {
+                                    success: false,
+                                    error: "RECORDING_NOT_FOUND"
+                                }
+                            );
+                            return;
+                        }
+
+                        const stat =
+                            fs.statSync(filePath);
+
+                        const range =
+                            req.headers.range;
+
+                        if (!range) {
+                            res.writeHead(
+                                200,
+                                {
+                                    "Content-Type": "audio/wav",
+                                    "Content-Length": stat.size,
+                                    "Accept-Ranges": "bytes",
+                                    "Cache-Control": "no-cache"
+                                }
+                            );
+
+                            fs.createReadStream(filePath).pipe(res);
+                            return;
+                        }
+
+                        const match =
+                            range.match(/bytes=(\d*)-(\d*)/);
+
+                        if (!match) {
+                            res.writeHead(
+                                416,
+                                {
+                                    "Content-Range": `bytes */${stat.size}`
+                                }
+                            );
+                            res.end();
+                            return;
+                        }
+
+                        let startByte =
+                            match[1] ? Number(match[1]) : Math.max(0, stat.size - Number(match[2]));
+
+                        let endByte =
+                            match[2] ? Number(match[2]) : stat.size - 1;
+
+                        if (Number.isNaN(startByte) || Number.isNaN(endByte) || startByte > endByte || startByte >= stat.size) {
+                            res.writeHead(
+                                416,
+                                {
+                                    "Content-Range": `bytes */${stat.size}`
+                                }
+                            );
+                            res.end();
+                            return;
+                        }
+
+                        endByte =
+                            Math.min(
+                                endByte,
+                                stat.size - 1
+                            );
+
+                        const chunkSize =
+                            endByte - startByte + 1;
+
+                        res.writeHead(
+                            206,
                             {
-                                success: false,
-                                error:
-                                    "PERMANENT_RECORDINGS_DISABLED"
+                                "Content-Type": "audio/wav",
+                                "Content-Length": chunkSize,
+                                "Content-Range": `bytes ${startByte}-${endByte}/${stat.size}`,
+                                "Accept-Ranges": "bytes",
+                                "Cache-Control": "no-cache"
                             }
                         );
+
+                        fs.createReadStream(
+                            filePath,
+                            {
+                                start: startByte,
+                                end: endByte
+                            }
+                        ).pipe(res);
 
                         return;
                     }
@@ -3408,12 +3638,11 @@
         }
 
         // =====================================================
-        // CREATE TEMPORARY WAV FROM PCM BUFFER
+        // WAV HELPERS
         // =====================================================
 
-        function createWavFromPCM(
-            pcmData,
-            wavPath
+        function createWavHeader(
+            pcmBytes
         ) {
 
             const byteRate =
@@ -3421,81 +3650,40 @@
                 CHANNELS *
                 BITS_PER_SAMPLE / 8;
 
-
             const blockAlign =
                 CHANNELS *
                 BITS_PER_SAMPLE / 8;
 
-
             const header =
                 Buffer.alloc(44);
 
+            header.write("RIFF", 0);
+            header.writeUInt32LE(36 + pcmBytes, 4);
+            header.write("WAVE", 8);
+            header.write("fmt ", 12);
+            header.writeUInt32LE(16, 16);
+            header.writeUInt16LE(1, 20);
+            header.writeUInt16LE(CHANNELS, 22);
+            header.writeUInt32LE(SAMPLE_RATE, 24);
+            header.writeUInt32LE(byteRate, 28);
+            header.writeUInt16LE(blockAlign, 32);
+            header.writeUInt16LE(BITS_PER_SAMPLE, 34);
+            header.write("data", 36);
+            header.writeUInt32LE(pcmBytes, 40);
 
-            header.write(
-                "RIFF",
-                0
-            );
+            return header;
+        }
 
-            header.writeUInt32LE(
-                36 + pcmData.length,
-                4
-            );
 
-            header.write(
-                "WAVE",
-                8
-            );
+        function createWavFromPCM(
+            pcmData,
+            wavPath
+        ) {
 
-            header.write(
-                "fmt ",
-                12
-            );
-
-            header.writeUInt32LE(
-                16,
-                16
-            );
-
-            header.writeUInt16LE(
-                1,
-                20
-            );
-
-            header.writeUInt16LE(
-                CHANNELS,
-                22
-            );
-
-            header.writeUInt32LE(
-                SAMPLE_RATE,
-                24
-            );
-
-            header.writeUInt32LE(
-                byteRate,
-                28
-            );
-
-            header.writeUInt16LE(
-                blockAlign,
-                32
-            );
-
-            header.writeUInt16LE(
-                BITS_PER_SAMPLE,
-                34
-            );
-
-            header.write(
-                "data",
-                36
-            );
-
-            header.writeUInt32LE(
-                pcmData.length,
-                40
-            );
-
+            const header =
+                createWavHeader(
+                    pcmData.length
+                );
 
             fs.writeFileSync(
                 wavPath,
@@ -3603,47 +3791,3 @@
                 console.log("");
             }
         );
-
-        // =====================================================
-        // GRACEFUL SHUTDOWN
-        // =====================================================
-
-        let shuttingDown = false;
-
-        async function shutdown(signal) {
-            if (shuttingDown) return;
-            shuttingDown = true;
-
-            console.log(`Received ${signal}; shutting down EchoClip cleanly...`);
-            clearInterval(udpFlushTimer);
-
-            for (const device of devices.values()) {
-                try {
-                    if (device.recording) {
-                        device.recording = false;
-                        await processRemainingTranscription(device);
-                    }
-                } catch (error) {
-                    console.error(`[${device.id}] shutdown transcription failed:`, error.message);
-                }
-
-                try {
-                    device.socket?.destroy();
-                } catch (_) {}
-            }
-
-            await new Promise(resolve => udpServer.close(() => resolve()));
-            await new Promise(resolve => tcpServer.close(() => resolve()));
-            await new Promise(resolve => httpServer.close(() => resolve()));
-
-            try {
-                if (redisClient && redisReady) {
-                    await redisClient.quit();
-                }
-            } catch (_) {}
-
-            process.exit(0);
-        }
-
-        process.on("SIGTERM", () => shutdown("SIGTERM"));
-        process.on("SIGINT", () => shutdown("SIGINT"));

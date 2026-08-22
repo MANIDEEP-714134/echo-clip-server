@@ -29,6 +29,9 @@
         const UDP_PACKET_END = 3;
         const UDP_DEVICE_ID_LEN = 24;
         const UDP_MIN_HEADER_SIZE = 46;
+        const UDP_AUTH_TOKEN_LEN = 16;
+        const UDP_SHARED_TOKEN = (process.env.UDP_SHARED_TOKEN || "").trim();
+        const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
         const SAMPLE_RATE = 16000;
         const CHANNELS = 1;
@@ -1729,10 +1732,13 @@
 
 
         // =====================================================
-        // UDP AUDIO SERVER (ESP32 -> AWS)
+        // PRODUCTION UDP AUDIO SERVER (ESP32 -> AWS)
         // =====================================================
 
         const udpServer = dgram.createSocket("udp4");
+
+        const UDP_REORDER_MAX_PACKETS = 4;
+        const UDP_REORDER_MAX_WAIT_MS = 120;
 
         const udpStats = {
             packets: 0,
@@ -1740,10 +1746,53 @@
             audioBytes: 0,
             malformed: 0,
             unknownDevice: 0,
-            droppedSequence: 0
+            droppedSequence: 0,
+            reorderedPackets: 0,
+            duplicatePackets: 0,
+            latePackets: 0,
+            recoveredSilenceBytes: 0,
+            activeStreams: 0
         };
 
-        const udpLastSequence = new Map();
+        // Per-device jitter/reorder state. UDP is intentionally unordered,
+        // so production audio must not immediately concatenate packets.
+        const udpStreams = new Map();
+
+        function getUdpStream(deviceId) {
+            let stream = udpStreams.get(deviceId);
+
+            if (!stream) {
+                stream = {
+                    nextSequence: null,
+                    pending: new Map(),
+                    firstPendingAt: 0,
+                    payloadBytes: 0,
+                    lastPacketAt: Date.now()
+                };
+                udpStreams.set(deviceId, stream);
+                udpStats.activeStreams = udpStreams.size;
+            }
+
+            return stream;
+        }
+
+        function resetUdpStream(deviceId) {
+            udpStreams.set(deviceId, {
+                nextSequence: null,
+                pending: new Map(),
+                firstPendingAt: 0,
+                payloadBytes: 0,
+                lastPacketAt: Date.now()
+            });
+            udpStats.activeStreams = udpStreams.size;
+            return udpStreams.get(deviceId);
+        }
+
+        function isSequenceBehind(sequence, expected) {
+            if (expected === null || expected === undefined) return false;
+            const distance = (sequence - expected) >>> 0;
+            return distance > 0x80000000;
+        }
 
         function parseEchoUdpPacket(message) {
             if (!Buffer.isBuffer(message) || message.length < UDP_MIN_HEADER_SIZE) {
@@ -1763,6 +1812,7 @@
 
             if (magic !== ECHO_UDP_MAGIC || version !== ECHO_UDP_VERSION) return null;
             if (headerSize < UDP_MIN_HEADER_SIZE || headerSize > message.length) return null;
+            if (payloadBytes > 1400) return null;
             if (headerSize + payloadBytes > message.length) return null;
 
             const deviceId = message
@@ -1772,6 +1822,19 @@
                 .trim();
 
             if (!deviceId) return null;
+
+            let authToken = "";
+            if (headerSize >= UDP_MIN_HEADER_SIZE + UDP_AUTH_TOKEN_LEN) {
+                authToken = message
+                    .subarray(46, 46 + UDP_AUTH_TOKEN_LEN)
+                    .toString("utf8")
+                    .replace(/\0.*$/, "")
+                    .trim();
+            }
+
+            if (UDP_SHARED_TOKEN && authToken !== UDP_SHARED_TOKEN) {
+                return null;
+            }
 
             return {
                 packetType,
@@ -1807,6 +1870,65 @@
             }
         }
 
+        function flushUdpStream(device, stream, force) {
+            if (!device || !stream || stream.nextSequence === null) return;
+
+            while (stream.pending.has(stream.nextSequence)) {
+                const payload = stream.pending.get(stream.nextSequence);
+                stream.pending.delete(stream.nextSequence);
+                ingestUdpAudio(device, payload);
+                stream.payloadBytes = payload.length;
+                stream.nextSequence = (stream.nextSequence + 1) >>> 0;
+            }
+
+            if (stream.pending.size === 0) {
+                stream.firstPendingAt = 0;
+                return;
+            }
+
+            const waitedMs = stream.firstPendingAt
+                ? Date.now() - stream.firstPendingAt
+                : 0;
+
+            // If the expected packet has not arrived within the jitter window,
+            // preserve the audio timeline by inserting silence for the missing
+            // packet rather than compressing the recording in time.
+            while (
+                stream.pending.size > UDP_REORDER_MAX_PACKETS ||
+                (force && stream.pending.size > 0) ||
+                (stream.firstPendingAt && waitedMs >= UDP_REORDER_MAX_WAIT_MS)
+            ) {
+                const silenceBytes = stream.payloadBytes ||
+                    stream.pending.values().next().value?.length || 0;
+
+                if (silenceBytes <= 0) break;
+
+                ingestUdpAudio(
+                    device,
+                    Buffer.alloc(silenceBytes)
+                );
+
+                udpStats.droppedSequence++;
+                udpStats.recoveredSilenceBytes += silenceBytes;
+                stream.nextSequence = (stream.nextSequence + 1) >>> 0;
+
+                while (stream.pending.has(stream.nextSequence)) {
+                    const payload = stream.pending.get(stream.nextSequence);
+                    stream.pending.delete(stream.nextSequence);
+                    ingestUdpAudio(device, payload);
+                    stream.payloadBytes = payload.length;
+                    stream.nextSequence = (stream.nextSequence + 1) >>> 0;
+                }
+
+                if (stream.pending.size === 0) {
+                    stream.firstPendingAt = 0;
+                    break;
+                }
+
+                stream.firstPendingAt = Date.now();
+            }
+        }
+
         udpServer.on("message", (message, rinfo) => {
             udpStats.packets++;
 
@@ -1828,14 +1950,20 @@
             device.lastSeen = Date.now();
 
             if (packet.packetType === UDP_PACKET_START) {
-                udpLastSequence.set(packet.deviceId, packet.sequence);
-                device.expectingRecordingData = true;
+                resetUdpStream(packet.deviceId);
+                const stream = udpStreams.get(packet.deviceId);
+                stream.nextSequence = packet.sequence >>> 0;
                 console.log(`[${device.id}] UDP AUDIO START from ${rinfo.address}:${rinfo.port}`);
                 return;
             }
 
             if (packet.packetType === UDP_PACKET_END) {
-                udpLastSequence.delete(packet.deviceId);
+                const stream = udpStreams.get(packet.deviceId);
+                if (stream) {
+                    flushUdpStream(device, stream, true);
+                }
+                udpStreams.delete(packet.deviceId);
+                udpStats.activeStreams = udpStreams.size;
                 console.log(`[${device.id}] UDP AUDIO END`);
                 return;
             }
@@ -1843,7 +1971,6 @@
             if (packet.packetType !== UDP_PACKET_AUDIO) return;
             if (!device.recording) return;
 
-            // Validate the format expected by the server/transcription pipeline.
             if (
                 packet.sampleRate !== SAMPLE_RATE ||
                 packet.bitsPerSample !== BITS_PER_SAMPLE ||
@@ -1857,20 +1984,52 @@
                 return;
             }
 
-            const previous = udpLastSequence.get(packet.deviceId);
-            if (previous !== undefined) {
-                const expected = (previous + 1) >>> 0;
-                if (packet.sequence !== expected) {
-                    const gap = (packet.sequence - expected) >>> 0;
-                    if (gap < 1000000) udpStats.droppedSequence += gap;
+            const stream = getUdpStream(packet.deviceId);
+            stream.lastPacketAt = Date.now();
+            stream.payloadBytes = packet.payload.length;
+
+            if (stream.nextSequence === null) {
+                stream.nextSequence = packet.sequence >>> 0;
+            }
+
+            if (isSequenceBehind(packet.sequence, stream.nextSequence)) {
+                udpStats.latePackets++;
+                return;
+            }
+
+            if (stream.pending.has(packet.sequence)) {
+                udpStats.duplicatePackets++;
+                return;
+            }
+
+            if (packet.sequence !== stream.nextSequence) {
+                udpStats.reorderedPackets++;
+                if (stream.firstPendingAt === 0) {
+                    stream.firstPendingAt = Date.now();
                 }
             }
-            udpLastSequence.set(packet.deviceId, packet.sequence);
 
+            stream.pending.set(packet.sequence, packet.payload);
             udpStats.audioPackets++;
             udpStats.audioBytes += packet.payload.length;
-            ingestUdpAudio(device, packet.payload);
+
+            flushUdpStream(device, stream, false);
         });
+
+        // Periodically flush a packet that has waited beyond the jitter window.
+        // This prevents a single lost packet from permanently stalling a stream.
+        const udpFlushTimer = setInterval(() => {
+            const now = Date.now();
+            for (const [deviceId, stream] of udpStreams) {
+                if (!stream.pending.size) continue;
+                if (!stream.firstPendingAt) continue;
+                if (now - stream.firstPendingAt < UDP_REORDER_MAX_WAIT_MS) continue;
+
+                const device = devices.get(deviceId);
+                if (device) flushUdpStream(device, stream, false);
+            }
+        }, 25);
+        udpFlushTimer.unref?.();
 
         udpServer.on("error", error => {
             console.error("UDP SERVER ERROR:", error);
@@ -1917,7 +2076,7 @@
                         "application/json",
 
                     "Access-Control-Allow-Origin":
-                        "*",
+                        ALLOWED_ORIGIN,
 
                     "Access-Control-Allow-Methods":
                         "GET,POST,OPTIONS",
@@ -2355,7 +2514,7 @@
                             204,
                             {
                                 "Access-Control-Allow-Origin":
-                                    "*",
+                                    ALLOWED_ORIGIN,
 
                                 "Access-Control-Allow-Methods":
                                     "GET,POST,OPTIONS",
@@ -2409,6 +2568,9 @@
 
                                 udpPort:
                                     UDP_PORT,
+
+                                udpAuthentication:
+                                    UDP_SHARED_TOKEN ? "enabled" : "disabled",
 
                                 udpStats:
                                     udpStats,
@@ -3441,3 +3603,47 @@
                 console.log("");
             }
         );
+
+        // =====================================================
+        // GRACEFUL SHUTDOWN
+        // =====================================================
+
+        let shuttingDown = false;
+
+        async function shutdown(signal) {
+            if (shuttingDown) return;
+            shuttingDown = true;
+
+            console.log(`Received ${signal}; shutting down EchoClip cleanly...`);
+            clearInterval(udpFlushTimer);
+
+            for (const device of devices.values()) {
+                try {
+                    if (device.recording) {
+                        device.recording = false;
+                        await processRemainingTranscription(device);
+                    }
+                } catch (error) {
+                    console.error(`[${device.id}] shutdown transcription failed:`, error.message);
+                }
+
+                try {
+                    device.socket?.destroy();
+                } catch (_) {}
+            }
+
+            await new Promise(resolve => udpServer.close(() => resolve()));
+            await new Promise(resolve => tcpServer.close(() => resolve()));
+            await new Promise(resolve => httpServer.close(() => resolve()));
+
+            try {
+                if (redisClient && redisReady) {
+                    await redisClient.quit();
+                }
+            } catch (_) {}
+
+            process.exit(0);
+        }
+
+        process.on("SIGTERM", () => shutdown("SIGTERM"));
+        process.on("SIGINT", () => shutdown("SIGINT"));

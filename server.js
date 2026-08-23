@@ -859,6 +859,94 @@
 
 
         // =====================================================
+        // PHYSICAL BUTTON EVENT FROM DEVICE
+        // =====================================================
+        //
+        // ESP32 sends BUTTON_START / BUTTON_STOP.
+        // The server owns the recording state and responds with
+        // the normal START / STOP command.
+        //
+        function handlePhysicalButton(device, event)
+        {
+            if (!device || !device.connected)
+                return;
+
+            const normalized =
+                String(event || "").trim().toUpperCase();
+
+            if (normalized === "BUTTON_START")
+            {
+                console.log(
+                    `[${device.id}] PHYSICAL BUTTON -> START`
+                );
+
+                if (device.recording)
+                {
+                    sendCommand(device, "BUTTON_ACK RECORDING");
+                    return;
+                }
+
+                const result = startRecording(device);
+
+                if (result.success)
+                {
+                    sendCommand(device, "BUTTON_ACK STARTED");
+                    console.log(
+                        `[${device.id}] Physical button START accepted`
+                    );
+                }
+                else
+                {
+                    sendCommand(device, "BUTTON_ACK ERROR");
+                    console.error(
+                        `[${device.id}] Physical button START failed:`,
+                        result.error
+                    );
+                }
+
+                return;
+            }
+
+            if (normalized === "BUTTON_STOP")
+            {
+                console.log(
+                    `[${device.id}] PHYSICAL BUTTON -> STOP`
+                );
+
+                if (!device.recording)
+                {
+                    sendCommand(device, "BUTTON_ACK NOT_RECORDING");
+                    return;
+                }
+
+                const result = stopRecording(device);
+
+                if (result.success)
+                {
+                    sendCommand(device, "BUTTON_ACK STOPPED");
+                    console.log(
+                        `[${device.id}] Physical button STOP accepted`
+                    );
+                }
+                else
+                {
+                    sendCommand(device, "BUTTON_ACK ERROR");
+                    console.error(
+                        `[${device.id}] Physical button STOP failed:`,
+                        result.error
+                    );
+                }
+
+                return;
+            }
+
+            console.log(
+                `[${device.id}] Unknown device event: ${normalized}`
+            );
+        }
+
+
+        // =====================================================
         // START RECORDING
         // =====================================================
 
@@ -1487,6 +1575,11 @@
                     let protocolBuffer =
                         Buffer.alloc(0);
 
+                    // TCP control messages from the ESP32 are newline-delimited.
+                    // TCP may split or combine messages, so buffer them.
+                    let deviceCommandBuffer = "";
+
+
 
 
 
@@ -1526,108 +1619,98 @@
 
 
                             // =================================================
-                            // RECORDING DATA
+                            // TCP CONTROL EVENTS FROM DEVICE
                             // =================================================
+                            //
+                            // UDP carries the actual PCM audio.
+                            // TCP carries control/status messages.
+                            //
+                            deviceCommandBuffer += data.toString("utf8");
 
-                            if (device.recording) {
-
-                                // UDP-mode ESP32 sends this status marker over TCP.
-                                // Audio itself arrives on UDP :5001, so never treat this marker as PCM.
-                                const tcpText = data.toString("utf8");
-                                if (tcpText.includes("RECORDING_UDP")) {
-                                    device.expectingRecordingData = false;
-                                    console.log(`[${device.id}] UDP audio mode armed`);
-                                    return;
-                                }
-
-                                /*
-                                * Everything received after START
-                                * is audio data.
-                                *
-                                * The ESP32 may send a small
-                                * "RECORDING\n" marker first.
-                                */
-
-                                if (!device.expectingRecordingData) {
-
-                                    const marker =
-                                        Buffer.from(
-                                            "RECORDING\n"
-                                        );
-
-
-                                    const index =
-                                        data.indexOf(
-                                            marker
-                                        );
-
-
-                                    if (index !== -1) {
-
-                                        console.log(
-                                            `[${device.id}] Audio stream started`
-                                        );
-
-
-                                        device.expectingRecordingData = true;
-
-
-                                        const audioStart =
-                                            index +
-                                            marker.length;
-
-
-                                        const remaining =
-                                            data.subarray(
-                                                audioStart
-                                            );
-
-
-                                        if (
-                                            remaining.length > 0
-                                        ) {
-
-                                            writeAudio(
-                                                remaining
-                                            );
-                                        }
-
-
-                                        return;
-                                    }
-
-
-                                    /*
-                                    * If the ESP32 does not send
-                                    * the marker, treat the data
-                                    * directly as PCM.
-                                    */
-
-                                    device.expectingRecordingData =
-                                        true;
-                                }
-
-
-                                // ---------------------------------------------
-                                // RAW PCM
-                                // ---------------------------------------------
-
-                                writeAudio(
-                                    data
-                                );
-
-                                return;
+                            if (deviceCommandBuffer.length > 4096)
+                            {
+                                deviceCommandBuffer =
+                                    deviceCommandBuffer.slice(-4096);
                             }
 
+                            let newlineIndex;
 
-                            // =================================================
-                            // NON-RECORDING DATA
-                            // =================================================
+                            while (
+                                (newlineIndex =
+                                    deviceCommandBuffer.indexOf("\n")) !== -1
+                            )
+                            {
+                                const line =
+                                    deviceCommandBuffer
+                                        .slice(0, newlineIndex)
+                                        .replace(/\r/g, "")
+                                        .trim();
 
-                            /*
-                            * Ignore anything else from the ESP32
-                            * while not recording.
-                            */
+                                deviceCommandBuffer =
+                                    deviceCommandBuffer.slice(
+                                        newlineIndex + 1
+                                    );
+
+                                if (!line)
+                                    continue;
+
+                                // Physical button events.
+                                if (
+                                    line === "BUTTON_START" ||
+                                    line === "BUTTON_STOP"
+                                )
+                                {
+                                    handlePhysicalButton(
+                                        device,
+                                        line
+                                    );
+
+                                    continue;
+                                }
+
+                                // UDP-mode marker.
+                                if (line === "RECORDING_UDP")
+                                {
+                                    device.expectingRecordingData = false;
+
+                                    console.log(
+                                        `[${device.id}] UDP audio mode armed`
+                                    );
+
+                                    continue;
+                                }
+
+                                // Heartbeat response.
+                                if (line === "PONG")
+                                {
+                                    device.lastSeen = Date.now();
+
+                                    console.log(
+                                        `[${device.id}] PONG`
+                                    );
+
+                                    continue;
+                                }
+
+                                // Legacy recording marker.
+                                if (line === "RECORDING")
+                                {
+                                    device.expectingRecordingData = true;
+
+                                    console.log(
+                                        `[${device.id}] Audio stream started`
+                                    );
+
+                                    continue;
+                                }
+
+                                console.log(
+                                    `[${device.id}] TCP message: ${line}`
+                                );
+                            }
+
+                            // Current protocol sends audio through UDP :5001.
+                            // Do not interpret TCP data as PCM.
 
                         }
                     );
@@ -3848,6 +3931,10 @@
 
                 console.log(
                     "Waiting for EchoClip devices..."
+                );
+
+                console.log(
+                    "Physical button protocol: BUTTON_START / BUTTON_STOP"
                 );
             }
         );

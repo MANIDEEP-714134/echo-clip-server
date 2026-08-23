@@ -1206,6 +1206,12 @@
                 const stat =
                     fs.statSync(filePath);
 
+                const expectedFileSize =
+                    44 + device.recordingBytes;
+
+                const storageVerified =
+                    stat.size === expectedFileSize;
+
                 console.log(
                     `[${device.id}] Recording saved | ` +
                     `${path.basename(filePath)} | ` +
@@ -1213,8 +1219,17 @@
                     `${(
                         device.recordingBytes /
                         (SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE / 8))
-                    ).toFixed(2)} sec`
+                    ).toFixed(2)} sec | ` +
+                    `storage ${storageVerified ? "OK" : "MISMATCH"}`
                 );
+
+                if (!storageVerified) {
+                    console.error(
+                        `[${device.id}] WAV size mismatch: ` +
+                        `expected ${expectedFileSize} bytes, ` +
+                        `got ${stat.size} bytes`
+                    );
+                }
 
                 return {
                     file: path.basename(filePath),
@@ -1780,14 +1795,81 @@
                         }
 
 
-                        // Audio is held only in RAM for the
-                        // active 30-second transcription chunk.
+                        // =================================================
+                        // PERMANENT RECORDING
+                        // =================================================
+                        // IMPORTANT:
+                        // The ESP32 in the current setup sends RAW PCM over
+                        // TCP. The previous version only counted the bytes
+                        // and placed them in the transcription buffer.
+                        // It never wrote TCP audio to the permanent WAV.
+                        //
+                        // That is why the final WAV was only 44 bytes:
+                        // it contained the reserved WAV header but no PCM.
+                        //
+                        // Write the EXACT incoming PCM bytes to the WAV file
+                        // before sending a copy to the transcription buffer.
+                        // =================================================
+
+                        try {
+
+                            if (
+                                device.recordingFd !== null &&
+                                device.recordingFd !== undefined
+                            ) {
+
+                                fs.writeSync(
+                                    device.recordingFd,
+                                    audioData,
+                                    0,
+                                    audioData.length
+                                );
+
+                            }
+                            else {
+
+                                device.recordingStorageError =
+                                    "Recording file descriptor is not open";
+
+                                console.error(
+                                    `[${device.id}] Permanent recording write skipped: ` +
+                                    `recording file descriptor is not open`
+                                );
+
+                                return;
+                            }
+
+                        }
+                        catch (error) {
+
+                            device.recordingStorageError =
+                                error.message;
+
+                            console.error(
+                                `[${device.id}] Permanent recording write failed:`,
+                                error.message
+                            );
+
+                            closeRecordingFile(
+                                device,
+                                false
+                            );
+
+                            return;
+                        }
+
+
+                        // =================================================
+                        // RECORDING BYTE COUNTERS
+                        // =================================================
+
                         device.recordingBytes +=
                             audioData.length;
 
 
                         device.audioBytes +=
                             audioData.length;
+
 
                         // =================================================
                         // LIVE TRANSCRIPTION BUFFER

@@ -580,13 +580,21 @@
                 "recordings"
             );
 
+        // Permanent transcripts are stored one-per-recording session.
+        // The transcript filename uses the exact same recordingId as the WAV.
+        const transcriptsDir =
+            path.join(
+                __dirname,
+                "transcripts"
+            );
+
         const tempAudioDir =
             path.join(
                 os.tmpdir(),
                 "echoclip-transcription"
             );
 
-        for (const dir of [recordingsDir, tempAudioDir]) {
+        for (const dir of [recordingsDir, transcriptsDir, tempAudioDir]) {
             if (!fs.existsSync(dir)) {
                 fs.mkdirSync(
                     dir,
@@ -708,6 +716,88 @@
 
 
         // =====================================================
+        // PERSIST TRANSCRIPT TO SESSION FILE
+        // =====================================================
+
+        function appendTranscriptToFile(
+            device,
+            chunkNumber,
+            text
+        ) {
+
+            if (
+                !device ||
+                !device.transcriptFilePath
+            ) {
+                return;
+            }
+
+            const normalizedText =
+                String(text || "").trim();
+
+            if (!normalizedText) {
+                return;
+            }
+
+            const block =
+                `[Chunk ${chunkNumber}] ${new Date().toISOString()}\n` +
+                `${normalizedText}\n\n`;
+
+            try {
+                fs.appendFileSync(
+                    device.transcriptFilePath,
+                    block,
+                    "utf8"
+                );
+            }
+            catch (error) {
+                console.error(
+                    `[${device.id}] Transcript file write failed:`,
+                    error.message
+                );
+            }
+        }
+
+
+        function finalizeTranscriptFile(
+            device
+        ) {
+
+            if (
+                !device ||
+                !device.transcriptFilePath ||
+                device.transcriptFinalized
+            ) {
+                return;
+            }
+
+            try {
+                const endedAt =
+                    new Date().toISOString();
+
+                fs.appendFileSync(
+                    device.transcriptFilePath,
+                    `\n--- SESSION FINALIZED: ${endedAt} ---\n`,
+                    "utf8"
+                );
+
+                device.transcriptFinalized = true;
+
+                console.log(
+                    `[${device.id}] Transcript finalized | ` +
+                    `${path.basename(device.transcriptFilePath)}`
+                );
+            }
+            catch (error) {
+                console.error(
+                    `[${device.id}] Transcript finalization failed:`,
+                    error.message
+                );
+            }
+        }
+
+
+        // =====================================================
         // CREATE WAV
         // =====================================================
 
@@ -783,6 +873,15 @@
 
                 recordingStorageError:
                     null,
+
+                transcriptFilePath:
+                    null,
+
+                transcriptFinalized:
+                    false,
+
+                transcriptionQueue:
+                    Promise.resolve(),
 
                 expectingRecordingData:
                     false,
@@ -991,6 +1090,12 @@
                     `${recordingId}.wav`
                 );
 
+            const transcriptFilePath =
+                path.join(
+                    transcriptsDir,
+                    `${recordingId}.txt`
+                );
+
             try {
 
                 if (fs.existsSync(recordingFilePath)) {
@@ -1014,8 +1119,27 @@
                     0
                 );
 
+                if (fs.existsSync(transcriptFilePath)) {
+                    fs.closeSync(fd);
+                    fs.unlinkSync(recordingFilePath);
+                    throw new Error(
+                        "Transcript file already exists"
+                    );
+                }
+
+                fs.writeFileSync(
+                    transcriptFilePath,
+                    `EchoClip Transcript\n` +
+                    `Recording ID: ${recordingId}\n` +
+                    `Device ID: ${device.id}\n` +
+                    `Started: ${new Date().toISOString()}\n\n`,
+                    "utf8"
+                );
+
                 device.recordingFd = fd;
                 device.recordingFilePath = recordingFilePath;
+                device.transcriptFilePath = transcriptFilePath;
+                device.transcriptFinalized = false;
                 device.recordingStorageError = null;
             }
             catch (error) {
@@ -1050,6 +1174,10 @@
             device.transcriptionProcessing =
                 false;
 
+            // Serialize transcription work so chunks are persisted in order.
+            device.transcriptionQueue =
+                Promise.resolve();
+
             device.liveTranscript =
                 "";
 
@@ -1077,6 +1205,18 @@
 
                 device.recording = false;
                 closeRecordingFile(device, true);
+
+                if (
+                    device.transcriptFilePath &&
+                    fs.existsSync(device.transcriptFilePath)
+                ) {
+                    try {
+                        fs.unlinkSync(device.transcriptFilePath);
+                    }
+                    catch (_) { }
+                }
+
+                device.transcriptFilePath = null;
 
                 return {
                     success: false,
@@ -1154,12 +1294,16 @@
             processRemainingTranscription(
                 device
             )
+            .then(
+                () => finalizeTranscriptFile(device)
+            )
             .catch(
                 error => {
                     console.error(
                         `[${device.id}] Final transcription failed:`,
                         error.message
                     );
+                    finalizeTranscriptFile(device);
                 }
             );
 
@@ -2072,12 +2216,16 @@
                             processRemainingTranscription(
                                 device
                             )
+                            .then(
+                                () => finalizeTranscriptFile(device)
+                            )
                             .catch(
                                 error => {
                                     console.error(
                                         `[${device.id}] Final transcription on disconnect failed:`,
                                         error.message
                                     );
+                                    finalizeTranscriptFile(device);
                                 }
                             );
 
@@ -2654,6 +2802,13 @@
                     text
                 );
 
+                // Persist this chunk permanently for this recording session.
+                appendTranscriptToFile(
+                    device,
+                    chunkNumber,
+                    text
+                );
+
                 // Keep the API response lightweight. The cache can
                 // contain up to 500 MB, but we only expose the latest
                 // 50 chunks (normally about 25 minutes) as live text.
@@ -2981,6 +3136,109 @@
                                     cacheStats
                             }
                         );
+
+                        return;
+                    }
+
+                    // =================================================
+                    // API: TRANSCRIPT HISTORY
+                    // =====================================================
+                    // Returns all permanently stored transcript files for
+                    // a device. Unlike the live endpoint, this endpoint
+                    // works even when the device is currently offline.
+
+                    const transcriptHistoryMatch =
+                        pathname.match(
+                            /^\/api\/devices\/([^/]+)\/transcripts$/
+                        );
+
+
+                    if (
+                        transcriptHistoryMatch &&
+                        req.method === "GET"
+                    ) {
+
+                        const deviceId =
+                            decodeURIComponent(
+                                transcriptHistoryMatch[1]
+                            );
+
+                        try {
+                            const prefix =
+                                `${deviceId}_`;
+
+                            const transcripts =
+                                fs.readdirSync(
+                                    transcriptsDir
+                                )
+                                    .filter(
+                                        file =>
+                                            file.toLowerCase().endsWith(".txt")
+                                    )
+                                    .filter(
+                                        file =>
+                                            file.startsWith(prefix)
+                                    )
+                                    .map(
+                                        file => {
+                                            const fullPath =
+                                                path.join(
+                                                    transcriptsDir,
+                                                    file
+                                                );
+
+                                            const stat =
+                                                fs.statSync(fullPath);
+
+                                            return {
+                                                file,
+                                                recordingId:
+                                                    path.basename(
+                                                        file,
+                                                        ".txt"
+                                                    ),
+                                                text:
+                                                    fs.readFileSync(
+                                                        fullPath,
+                                                        "utf8"
+                                                    ),
+                                                size: stat.size,
+                                                created:
+                                                    stat.birthtime.toISOString(),
+                                                modified:
+                                                    stat.mtime.toISOString()
+                                            };
+                                        }
+                                    )
+                                    .sort(
+                                        (a, b) =>
+                                            b.recordingId.localeCompare(
+                                                a.recordingId
+                                            )
+                                    );
+
+                            sendJSON(
+                                res,
+                                200,
+                                {
+                                    success: true,
+                                    deviceId,
+                                    count: transcripts.length,
+                                    transcripts
+                                }
+                            );
+                        }
+                        catch (error) {
+                            sendJSON(
+                                res,
+                                500,
+                                {
+                                    success: false,
+                                    error: "TRANSCRIPT_HISTORY_FAILED",
+                                    details: error.message
+                                }
+                            );
+                        }
 
                         return;
                     }
@@ -3689,11 +3947,27 @@
                 * The processing happens asynchronously.
                 */
 
-                processTranscriptionChunk(
-                    device,
-                    chunk,
-                    chunkNumber
-                );
+                // Queue chunks so transcription and file persistence
+                // always follow recording order, even if ElevenLabs
+                // takes different amounts of time for each chunk.
+                device.transcriptionQueue =
+                    device.transcriptionQueue
+                        .then(
+                            () =>
+                                processTranscriptionChunk(
+                                    device,
+                                    chunk,
+                                    chunkNumber
+                                )
+                        )
+                        .catch(
+                            error => {
+                                console.error(
+                                    `[${device.id}] Queued transcription chunk #${chunkNumber} failed:`,
+                                    error.message
+                                );
+                            }
+                        );
             }
         }
 
@@ -3795,11 +4069,26 @@
             );
 
 
-            await processTranscriptionChunk(
-                device,
-                chunk,
-                chunkNumber
-            );
+            device.transcriptionQueue =
+                device.transcriptionQueue
+                    .then(
+                        () =>
+                            processTranscriptionChunk(
+                                device,
+                                chunk,
+                                chunkNumber
+                            )
+                    )
+                    .catch(
+                        error => {
+                            console.error(
+                                `[${device.id}] Queued final transcription chunk #${chunkNumber} failed:`,
+                                error.message
+                            );
+                        }
+                    );
+
+            await device.transcriptionQueue;
         }
 
         // =====================================================

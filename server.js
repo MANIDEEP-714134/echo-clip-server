@@ -722,12 +722,13 @@
         function appendTranscriptToFile(
             device,
             chunkNumber,
-            text
+            text,
+            transcriptFilePath = device && device.transcriptFilePath
         ) {
 
             if (
                 !device ||
-                !device.transcriptFilePath
+                !transcriptFilePath
             ) {
                 return;
             }
@@ -745,7 +746,7 @@
 
             try {
                 fs.appendFileSync(
-                    device.transcriptFilePath,
+                    transcriptFilePath,
                     block,
                     "utf8"
                 );
@@ -771,29 +772,14 @@
                 return;
             }
 
-            try {
-                const endedAt =
-                    new Date().toISOString();
+            // The transcript file itself is the final session file.
+            // No extra "SESSION FINALIZED" marker is written.
+            device.transcriptFinalized = true;
 
-                fs.appendFileSync(
-                    device.transcriptFilePath,
-                    `\n--- SESSION FINALIZED: ${endedAt} ---\n`,
-                    "utf8"
-                );
-
-                device.transcriptFinalized = true;
-
-                console.log(
-                    `[${device.id}] Transcript finalized | ` +
-                    `${path.basename(device.transcriptFilePath)}`
-                );
-            }
-            catch (error) {
-                console.error(
-                    `[${device.id}] Transcript finalization failed:`,
-                    error.message
-                );
-            }
+            console.log(
+                `[${device.id}] Transcript finalized | ` +
+                `${path.basename(device.transcriptFilePath)}`
+            );
         }
 
 
@@ -899,7 +885,10 @@
                     false,
 
                 liveTranscript:
-                    ""
+                    "",
+
+                liveTranscriptChunks:
+                    []
             };
         }
 
@@ -1180,6 +1169,9 @@
 
             device.liveTranscript =
                 "";
+
+            device.liveTranscriptChunks =
+                [];
 
             device.expectingRecordingData =
                 false;
@@ -2703,11 +2695,13 @@
         async function processTranscriptionChunk(
             device,
             pcmData,
-            chunkNumber
+            chunkNumber,
+            sessionId = device.recordingId,
+            sessionTranscriptFilePath = device.transcriptFilePath
         ) {
 
             const baseName =
-                `${device.recordingId}_chunk_${String(chunkNumber).padStart(4, "0")}`;
+                `${sessionId}_chunk_${String(chunkNumber).padStart(4, "0")}`;
 
 
             const rawWavPath =
@@ -2802,32 +2796,28 @@
                     text
                 );
 
-                // Persist this chunk permanently for this recording session.
+                // Persist this chunk to the transcript file belonging to
+                // THIS recording session, not whichever session is current.
                 appendTranscriptToFile(
                     device,
                     chunkNumber,
-                    text
+                    text,
+                    sessionTranscriptFilePath
                 );
 
-                // Keep the API response lightweight. The cache can
-                // contain up to 500 MB, but we only expose the latest
-                // 50 chunks (normally about 25 minutes) as live text.
-                const recentEntries =
-                    await getDeviceTranscript(
-                        device.id
-                    );
+                // Live transcript is isolated to the current recording
+                // session. Never rebuild it from the global/device cache,
+                // because that cache contains previous sessions too.
+                if (
+                    device.recordingId === sessionId
+                ) {
+                    if (text) {
+                        device.liveTranscriptChunks.push(text);
+                    }
 
-                const recentTexts =
-                    recentEntries
-                        .slice(-50)
-                        .map(
-                            entry =>
-                                entry.text
-                        )
-                        .filter(Boolean);
-
-                device.liveTranscript =
-                    recentTexts.join(" ");
+                    device.liveTranscript =
+                        device.liveTranscriptChunks.join(" ");
+                }
 
                 console.log(
                     `[${device.id}] ` +
@@ -3181,39 +3171,35 @@
                                     )
                                     .map(
                                         file => {
-                                            const fullPath =
-                                                path.join(
-                                                    transcriptsDir,
-                                                    file
+                                            const recordingId =
+                                                path.basename(
+                                                    file,
+                                                    ".txt"
                                                 );
 
-                                            const stat =
-                                                fs.statSync(fullPath);
+                                            // Filename format: DEVICE_YYYYMMDD_HHMMSS.txt
+                                            const timestampMatch =
+                                                recordingId.match(/_(\d{8})_(\d{6})$/);
+
+                                            let timestamp = null;
+
+                                            if (timestampMatch) {
+                                                const [, datePart, timePart] = timestampMatch;
+                                                timestamp =
+                                                    `${datePart.slice(0, 4)}-${datePart.slice(4, 6)}-${datePart.slice(6, 8)}T` +
+                                                    `${timePart.slice(0, 2)}:${timePart.slice(2, 4)}:${timePart.slice(4, 6)}`;
+                                            }
 
                                             return {
                                                 file,
-                                                recordingId:
-                                                    path.basename(
-                                                        file,
-                                                        ".txt"
-                                                    ),
-                                                text:
-                                                    fs.readFileSync(
-                                                        fullPath,
-                                                        "utf8"
-                                                    ),
-                                                size: stat.size,
-                                                created:
-                                                    stat.birthtime.toISOString(),
-                                                modified:
-                                                    stat.mtime.toISOString()
+                                                timestamp
                                             };
                                         }
                                     )
                                     .sort(
                                         (a, b) =>
-                                            b.recordingId.localeCompare(
-                                                a.recordingId
+                                            String(b.timestamp || "").localeCompare(
+                                                String(a.timestamp || "")
                                             )
                                     );
 
@@ -3950,6 +3936,9 @@
                 // Queue chunks so transcription and file persistence
                 // always follow recording order, even if ElevenLabs
                 // takes different amounts of time for each chunk.
+                const sessionId = device.recordingId;
+                const sessionTranscriptFilePath = device.transcriptFilePath;
+
                 device.transcriptionQueue =
                     device.transcriptionQueue
                         .then(
@@ -3957,7 +3946,9 @@
                                 processTranscriptionChunk(
                                     device,
                                     chunk,
-                                    chunkNumber
+                                    chunkNumber,
+                                    sessionId,
+                                    sessionTranscriptFilePath
                                 )
                         )
                         .catch(
@@ -4069,6 +4060,9 @@
             );
 
 
+            const sessionId = device.recordingId;
+            const sessionTranscriptFilePath = device.transcriptFilePath;
+
             device.transcriptionQueue =
                 device.transcriptionQueue
                     .then(
@@ -4076,7 +4070,9 @@
                             processTranscriptionChunk(
                                 device,
                                 chunk,
-                                chunkNumber
+                                chunkNumber,
+                                sessionId,
+                                sessionTranscriptFilePath
                             )
                     )
                     .catch(
